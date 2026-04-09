@@ -260,6 +260,43 @@ const formatRelativePath = (path: string) => {
   return `workspace/${cleanPath.replace(`${cleanRoot}/`, "")}`;
 };
 
+const pathIsWithin = (value: string, prefix: string) => {
+  const cleanValue = stripTrailingSlash(value);
+  const cleanPrefix = stripTrailingSlash(prefix);
+  return cleanValue === cleanPrefix || cleanValue.startsWith(`${cleanPrefix}/`);
+};
+
+const remapPathPrefix = (value: string, from: string, to: string) => {
+  const cleanValue = stripTrailingSlash(value);
+  const cleanFrom = stripTrailingSlash(from);
+  const cleanTo = stripTrailingSlash(to);
+
+  if (cleanValue === cleanFrom) {
+    return cleanTo;
+  }
+
+  if (cleanValue.startsWith(`${cleanFrom}/`)) {
+    return `${cleanTo}${cleanValue.slice(cleanFrom.length)}`;
+  }
+
+  return value;
+};
+
+const dedupeRecentsByPath = (items: RecentFile[]) => {
+  const seen = new Set<string>();
+  const next: RecentFile[] = [];
+
+  for (const item of items) {
+    if (seen.has(item.path)) {
+      continue;
+    }
+    seen.add(item.path);
+    next.push(item);
+  }
+
+  return next.slice(0, MAX_RECENT_FILES);
+};
+
 function IPCoderApp() {
   const webviewRef = useRef<WebView>(null);
   const syncedTabForWebViewRef = useRef<string | null>(null);
@@ -287,6 +324,12 @@ function IPCoderApp() {
   const [loadingState, setLoadingState] = useState<string>("Booting workspace...");
   const [newFileModalVisible, setNewFileModalVisible] = useState<boolean>(false);
   const [newFileName, setNewFileName] = useState<string>("untitled.js");
+  const [newFolderModalVisible, setNewFolderModalVisible] = useState<boolean>(false);
+  const [newFolderName, setNewFolderName] = useState<string>("new-folder");
+  const [entryActionModalVisible, setEntryActionModalVisible] = useState<boolean>(false);
+  const [selectedEntry, setSelectedEntry] = useState<FileEntry | null>(null);
+  const [renameModalVisible, setRenameModalVisible] = useState<boolean>(false);
+  const [renameValue, setRenameValue] = useState<string>("");
 
   const activeTab = useMemo(
     () => tabs.find((tab) => tab.id === activeTabId) ?? null,
@@ -354,6 +397,35 @@ function IPCoderApp() {
     },
     [persistRecents, recents],
   );
+
+  const removeRecentEntriesByPrefix = useCallback(
+    async (prefixPath: string) => {
+      const next = recents.filter((item) => !pathIsWithin(item.path, prefixPath));
+      await persistRecents(next);
+    },
+    [persistRecents, recents],
+  );
+
+  const remapRecentEntriesByPrefix = useCallback(
+    async (fromPath: string, toPath: string) => {
+      const mapped = recents.map((item) => {
+        const nextPath = remapPathPrefix(item.path, fromPath, toPath);
+        return {
+          ...item,
+          path: nextPath,
+          name: basename(nextPath),
+        };
+      });
+
+      await persistRecents(dedupeRecentsByPath(mapped));
+    },
+    [persistRecents, recents],
+  );
+
+  const openEntryActionMenu = useCallback((entry: FileEntry) => {
+    setSelectedEntry(entry);
+    setEntryActionModalVisible(true);
+  }, []);
 
   const refreshCurrentDirectory = useCallback(async () => {
     setLoadingState("Reading local files...");
@@ -712,6 +784,10 @@ function IPCoderApp() {
       Alert.alert("Invalid Name", "Enter a file name.");
       return;
     }
+    if (trimmed.includes("/") || trimmed.includes("\\")) {
+      Alert.alert("Invalid Name", "File names cannot include / or \\.");
+      return;
+    }
 
     const destination = joinFsPath(currentDirectory, trimmed);
 
@@ -736,6 +812,214 @@ function IPCoderApp() {
       Alert.alert("Create Error", "Unable to create the file.");
     }
   }, [currentDirectory, newFileName, openFile, refreshCurrentDirectory]);
+
+  const createFolder = useCallback(async () => {
+    const trimmed = newFolderName.trim();
+    if (!trimmed) {
+      Alert.alert("Invalid Name", "Enter a folder name.");
+      return;
+    }
+    if (trimmed.includes("/") || trimmed.includes("\\")) {
+      Alert.alert("Invalid Name", "Folder names cannot include / or \\.");
+      return;
+    }
+
+    const destination = joinFsPath(currentDirectory, trimmed);
+
+    try {
+      const folderInfo = await FileSystem.getInfoAsync(destination);
+      if (folderInfo.exists) {
+        Alert.alert("Already Exists", "A file or folder with this name already exists.");
+        return;
+      }
+
+      await FileSystem.makeDirectoryAsync(destination, { intermediates: true });
+
+      setNewFolderModalVisible(false);
+      setNewFolderName("new-folder");
+      await refreshCurrentDirectory();
+    } catch (error) {
+      console.error(error);
+      Alert.alert("Create Error", "Unable to create the folder.");
+    }
+  }, [currentDirectory, newFolderName, refreshCurrentDirectory]);
+
+  const resolveDuplicatePath = useCallback(async (entry: FileEntry) => {
+    const sourceName = entry.name;
+    const extensionIndex = entry.isDirectory ? -1 : sourceName.lastIndexOf(".");
+    const base =
+      extensionIndex > 0 ? sourceName.slice(0, extensionIndex) : sourceName;
+    const extension = extensionIndex > 0 ? sourceName.slice(extensionIndex) : "";
+    const folderPath = parentPath(entry.path, WORKSPACE_ROOT);
+
+    for (let counter = 1; counter <= 500; counter += 1) {
+      const suffix = counter === 1 ? " copy" : ` copy ${counter}`;
+      const candidatePath = joinFsPath(folderPath, `${base}${suffix}${extension}`);
+      const candidateInfo = await FileSystem.getInfoAsync(candidatePath);
+      if (!candidateInfo.exists) {
+        return candidatePath;
+      }
+    }
+
+    throw new Error("Could not allocate a duplicate name.");
+  }, []);
+
+  const duplicateEntry = useCallback(
+    async (entry: FileEntry) => {
+      try {
+        const destination = await resolveDuplicatePath(entry);
+        await FileSystem.copyAsync({
+          from: entry.path,
+          to: destination,
+        });
+
+        setEntryActionModalVisible(false);
+        setSelectedEntry(null);
+        await refreshCurrentDirectory();
+      } catch (error) {
+        console.error(error);
+        Alert.alert("Duplicate Error", "Unable to duplicate the selected item.");
+      }
+    },
+    [refreshCurrentDirectory, resolveDuplicatePath],
+  );
+
+  const startRenameEntry = useCallback((entry: FileEntry) => {
+    setEntryActionModalVisible(false);
+    setSelectedEntry(entry);
+    setRenameValue(entry.name);
+    setRenameModalVisible(true);
+  }, []);
+
+  const commitRenameEntry = useCallback(async () => {
+    if (!selectedEntry) {
+      return;
+    }
+
+    const trimmed = renameValue.trim();
+    if (!trimmed) {
+      Alert.alert("Invalid Name", "Enter a valid name.");
+      return;
+    }
+    if (trimmed.includes("/") || trimmed.includes("\\")) {
+      Alert.alert("Invalid Name", "Names cannot include / or \\.");
+      return;
+    }
+
+    const destination = joinFsPath(parentPath(selectedEntry.path, WORKSPACE_ROOT), trimmed);
+    if (stripTrailingSlash(destination) === stripTrailingSlash(selectedEntry.path)) {
+      setRenameModalVisible(false);
+      setRenameValue("");
+      setSelectedEntry(null);
+      return;
+    }
+
+    try {
+      const destinationInfo = await FileSystem.getInfoAsync(destination);
+      if (destinationInfo.exists) {
+        Alert.alert("Already Exists", "A file or folder with this name already exists.");
+        return;
+      }
+
+      await FileSystem.moveAsync({
+        from: selectedEntry.path,
+        to: destination,
+      });
+
+      setTabs((prev) =>
+        prev.map((tab) => {
+          const nextPath = remapPathPrefix(tab.path, selectedEntry.path, destination);
+          if (nextPath === tab.path) {
+            return tab;
+          }
+          return {
+            ...tab,
+            path: nextPath,
+            name: basename(nextPath),
+          };
+        }),
+      );
+
+      await remapRecentEntriesByPrefix(selectedEntry.path, destination);
+
+      if (pathIsWithin(currentDirectory, selectedEntry.path)) {
+        setCurrentDirectory(remapPathPrefix(currentDirectory, selectedEntry.path, destination));
+      }
+
+      setRenameModalVisible(false);
+      setRenameValue("");
+      setSelectedEntry(null);
+      await refreshCurrentDirectory();
+    } catch (error) {
+      console.error(error);
+      Alert.alert("Rename Error", "Unable to rename the selected item.");
+    }
+  }, [
+    currentDirectory,
+    refreshCurrentDirectory,
+    remapRecentEntriesByPrefix,
+    renameValue,
+    selectedEntry,
+  ]);
+
+  const deleteEntryNow = useCallback(
+    async (entry: FileEntry) => {
+      try {
+        await FileSystem.deleteAsync(entry.path, { idempotent: true });
+
+        const remainingTabs = tabs.filter((tab) => !pathIsWithin(tab.path, entry.path));
+        setTabs(remainingTabs);
+        if (!remainingTabs.some((tab) => tab.id === activeTabId)) {
+          setActiveTabId(remainingTabs[0]?.id ?? null);
+        }
+        if (!remainingTabs.length) {
+          setSearchVisible(false);
+        }
+
+        await removeRecentEntriesByPrefix(entry.path);
+
+        setEntryActionModalVisible(false);
+        setSelectedEntry(null);
+        setRenameModalVisible(false);
+
+        if (pathIsWithin(currentDirectory, entry.path)) {
+          setCurrentDirectory(parentPath(entry.path, WORKSPACE_ROOT));
+        }
+
+        await refreshCurrentDirectory();
+      } catch (error) {
+        console.error(error);
+        Alert.alert("Delete Error", "Unable to delete the selected item.");
+      }
+    },
+    [activeTabId, currentDirectory, refreshCurrentDirectory, removeRecentEntriesByPrefix, tabs],
+  );
+
+  const requestDeleteEntry = useCallback(
+    (entry: FileEntry) => {
+      const impactedTabs = tabs.filter((tab) => pathIsWithin(tab.path, entry.path));
+      const hasUnsaved = impactedTabs.some((tab) => tab.content !== tab.savedContent);
+      const targetType = entry.isDirectory ? "folder" : "file";
+
+      Alert.alert(
+        `Delete ${targetType}?`,
+        hasUnsaved
+          ? `This will permanently delete ${entry.name} and discard unsaved open tabs.`
+          : `This will permanently delete ${entry.name}.`,
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Delete",
+            style: "destructive",
+            onPress: () => {
+              void deleteEntryNow(entry);
+            },
+          },
+        ],
+      );
+    },
+    [deleteEntryNow, tabs],
+  );
 
   const toggleSetting = useCallback(
     async (key: keyof AppSettings) => {
@@ -874,6 +1158,9 @@ function IPCoderApp() {
           <Pressable style={styles.headerButton} onPress={() => setNewFileModalVisible(true)}>
             <Text style={styles.headerButtonText}>[+] New File</Text>
           </Pressable>
+          <Pressable style={styles.headerButton} onPress={() => setNewFolderModalVisible(true)}>
+            <Text style={styles.headerButtonText}>[+] New Folder</Text>
+          </Pressable>
           <Pressable
             style={styles.headerButton}
             onPress={() => {
@@ -916,6 +1203,7 @@ function IPCoderApp() {
 
         <Text style={styles.sectionLabel}>Directory Tree</Text>
         {renderBreadcrumb()}
+        <Text style={styles.listHintText}>Long press files/folders for actions.</Text>
 
         {stripTrailingSlash(currentDirectory) !== stripTrailingSlash(WORKSPACE_ROOT) ? (
           <Pressable
@@ -938,6 +1226,8 @@ function IPCoderApp() {
                 void openFile(entry.path);
               }
             }}
+            onLongPress={() => openEntryActionMenu(entry)}
+            delayLongPress={250}
           >
             <Text style={entry.isDirectory ? styles.fileRowDirectory : styles.fileRowName}>
               {entry.isDirectory ? `[DIR] ${entry.name}` : entry.name}
@@ -1221,6 +1511,117 @@ function IPCoderApp() {
       {screen === "editor" ? renderEditorScreen() : null}
       {screen === "settings" ? renderSettingsScreen() : null}
 
+      <Modal
+        visible={entryActionModalVisible && !!selectedEntry}
+        transparent
+        animationType="none"
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Actions</Text>
+            <Text style={styles.modalPath}>
+              {selectedEntry ? formatRelativePath(selectedEntry.path) : ""}
+            </Text>
+
+            <View style={styles.actionMenuList}>
+              <Pressable
+                style={styles.actionMenuButton}
+                onPress={() => {
+                  if (!selectedEntry) {
+                    return;
+                  }
+                  setEntryActionModalVisible(false);
+                  setSelectedEntry(null);
+                  if (selectedEntry.isDirectory) {
+                    setCurrentDirectory(selectedEntry.path);
+                    return;
+                  }
+                  void openFile(selectedEntry.path);
+                }}
+              >
+                <Text style={styles.actionMenuButtonText}>
+                  {selectedEntry?.isDirectory ? "Open Folder" : "Open File"}
+                </Text>
+              </Pressable>
+
+              <Pressable
+                style={styles.actionMenuButton}
+                onPress={() => {
+                  if (!selectedEntry) {
+                    return;
+                  }
+                  startRenameEntry(selectedEntry);
+                }}
+              >
+                <Text style={styles.actionMenuButtonText}>Rename</Text>
+              </Pressable>
+
+              <Pressable
+                style={styles.actionMenuButton}
+                onPress={() => {
+                  if (!selectedEntry) {
+                    return;
+                  }
+                  void duplicateEntry(selectedEntry);
+                }}
+              >
+                <Text style={styles.actionMenuButtonText}>Duplicate</Text>
+              </Pressable>
+
+              <Pressable
+                style={[styles.actionMenuButton, styles.actionMenuButtonDanger]}
+                onPress={() => {
+                  if (!selectedEntry) {
+                    return;
+                  }
+                  requestDeleteEntry(selectedEntry);
+                }}
+              >
+                <Text style={[styles.actionMenuButtonText, styles.actionMenuButtonDangerText]}>
+                  Delete
+                </Text>
+              </Pressable>
+            </View>
+
+            <View style={styles.modalActions}>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setEntryActionModalVisible(false);
+                  setSelectedEntry(null);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={newFolderModalVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>New Folder</Text>
+            <Text style={styles.modalPath}>{formatRelativePath(currentDirectory)}</Text>
+            <TextInput
+              style={styles.modalInput}
+              value={newFolderName}
+              onChangeText={setNewFolderName}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButton} onPress={() => setNewFolderModalVisible(false)}>
+                <Text style={styles.modalButtonText}>Cancel</Text>
+              </Pressable>
+              <Pressable style={styles.modalButtonPrimary} onPress={() => void createFolder()}>
+                <Text style={styles.modalButtonPrimaryText}>Create</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
       <Modal visible={newFileModalVisible} transparent animationType="none">
         <View style={styles.modalBackdrop}>
           <View style={styles.modalCard}>
@@ -1239,6 +1640,39 @@ function IPCoderApp() {
               </Pressable>
               <Pressable style={styles.modalButtonPrimary} onPress={() => void createFile()}>
                 <Text style={styles.modalButtonPrimaryText}>Create</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={renameModalVisible && !!selectedEntry} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Rename</Text>
+            <Text style={styles.modalPath}>
+              {selectedEntry ? formatRelativePath(selectedEntry.path) : ""}
+            </Text>
+            <TextInput
+              style={styles.modalInput}
+              value={renameValue}
+              onChangeText={setRenameValue}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <View style={styles.modalActions}>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setRenameModalVisible(false);
+                  setRenameValue("");
+                  setSelectedEntry(null);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Cancel</Text>
+              </Pressable>
+              <Pressable style={styles.modalButtonPrimary} onPress={() => void commitRenameEntry()}>
+                <Text style={styles.modalButtonPrimaryText}>Save</Text>
               </Pressable>
             </View>
           </View>
@@ -1358,6 +1792,13 @@ const styles = StyleSheet.create({
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginTop: 2,
+  },
+  listHintText: {
+    color: "#555555",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 11,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
   },
   tabStrip: {
     borderBottomWidth: 1,
@@ -1589,6 +2030,27 @@ const styles = StyleSheet.create({
     fontSize: 13,
     paddingHorizontal: 8,
     paddingVertical: 8,
+  },
+  actionMenuList: {
+    gap: 8,
+  },
+  actionMenuButton: {
+    borderWidth: 1,
+    borderColor: "#555555",
+    backgroundColor: "#000000",
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+  },
+  actionMenuButtonText: {
+    color: "#FFFFFF",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 12,
+  },
+  actionMenuButtonDanger: {
+    borderColor: "#FF003C",
+  },
+  actionMenuButtonDangerText: {
+    color: "#FF003C",
   },
   modalActions: {
     flexDirection: "row",
