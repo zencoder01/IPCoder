@@ -18,6 +18,7 @@ Offline-first mobile code editor for Android built with React Native (Expo) and 
 - Recent files list (max 20 persisted entries)
 - Pinned folders
 - Multi-select mode with bulk move/delete
+- Hamburger sidebar menu for primary actions (files/editor/settings/tools)
 - Multi-tab editor (max 8 tabs) with unsaved `*` indicator
 - Toolbar actions: Undo, Redo, Search, Word Wrap, Indent, Comment, Theme toggle, Format, Snippets, Command Palette, Outline, MiniMap
 - Inline Search Palette with search/replace + case/regex/whole-word toggles
@@ -30,6 +31,7 @@ Offline-first mobile code editor for Android built with React Native (Expo) and 
 - Lightweight outline panel + minimap preview
 - Online AI assistant panel (OpenAI API key + model, prompt history, apply AI output to editor)
 - Save Copy flow to Android local storage / SD card folders via SAF directory permissions
+- External folder mount card + SAF external folder browser modal
 - Bottom status bar: language, UTF-8, tab size, Ln/Col
 - Settings screen with categorized toggles and reset-to-defaults
 

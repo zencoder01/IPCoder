@@ -171,6 +171,12 @@ interface AiMessage {
   timestamp: number;
 }
 
+interface ExternalBrowserEntry {
+  uri: string;
+  name: string;
+  isDirectory: boolean;
+}
+
 const STORAGE_SETTINGS_KEY = "ipcoder.settings.v1";
 const STORAGE_RECENTS_KEY = "ipcoder.recents.v1";
 const STORAGE_SESSION_KEY = "ipcoder.session.v1";
@@ -364,6 +370,9 @@ const webviewHtml = (bundleCode: string, jetbrainsBase64: string) => {
 };
 
 const formatRelativePath = (path: string) => {
+  if (path.startsWith("content://")) {
+    return `external/${decodeSafDisplayName(path)}`;
+  }
   const cleanRoot = stripTrailingSlash(WORKSPACE_ROOT);
   const cleanPath = stripTrailingSlash(path);
   if (cleanPath === cleanRoot) {
@@ -535,6 +544,16 @@ const fileNameWithoutExtension = (name: string) => {
   return clean.slice(0, dot);
 };
 
+const decodeSafDisplayName = (uri: string) => {
+  const source = uri.includes("/") ? uri.slice(uri.lastIndexOf("/") + 1) : uri;
+  const normalized = source.includes(":") ? source.slice(source.lastIndexOf(":") + 1) : source;
+  try {
+    return decodeURIComponent(normalized);
+  } catch {
+    return normalized;
+  }
+};
+
 const mimeTypeForFileName = (name: string) => {
   const extension = extensionFromName(name);
   switch (extension) {
@@ -672,6 +691,11 @@ function IPCoderApp() {
   const [saveCopyModalVisible, setSaveCopyModalVisible] = useState<boolean>(false);
   const [saveCopyName, setSaveCopyName] = useState<string>("");
   const [externalSaveDirUri, setExternalSaveDirUri] = useState<string>("");
+  const [menuVisible, setMenuVisible] = useState<boolean>(false);
+  const [externalBrowserVisible, setExternalBrowserVisible] = useState<boolean>(false);
+  const [externalBrowserBusy, setExternalBrowserBusy] = useState<boolean>(false);
+  const [externalBrowserEntries, setExternalBrowserEntries] = useState<ExternalBrowserEntry[]>([]);
+  const [externalBrowserStack, setExternalBrowserStack] = useState<string[]>([]);
 
   const activeTab = useMemo(
     () => tabs.find((tab) => tab.id === activeTabId) ?? null,
@@ -1435,10 +1459,24 @@ function IPCoderApp() {
     }
 
     try {
-      await backupFileIfNeeded(activeTab.path, activeTab.savedContent);
-      await FileSystem.writeAsStringAsync(activeTab.path, activeTab.content, {
-        encoding: FileSystem.EncodingType.UTF8,
-      });
+      const isExternal = activeTab.path.startsWith("content://");
+      if (!isExternal) {
+        await backupFileIfNeeded(activeTab.path, activeTab.savedContent);
+      }
+
+      if (isExternal) {
+        await FileSystem.StorageAccessFramework.writeAsStringAsync(
+          activeTab.path,
+          activeTab.content,
+          {
+            encoding: FileSystem.EncodingType.UTF8,
+          },
+        );
+      } else {
+        await FileSystem.writeAsStringAsync(activeTab.path, activeTab.content, {
+          encoding: FileSystem.EncodingType.UTF8,
+        });
+      }
 
       setTabs((prev) =>
         prev.map((tab) =>
@@ -1452,7 +1490,9 @@ function IPCoderApp() {
       );
 
       await touchRecentFile(activeTab.path);
-      await refreshCurrentDirectory();
+      if (!isExternal) {
+        await refreshCurrentDirectory();
+      }
       await addCommandHistory(`Save ${activeTab.name}`);
     } catch (error) {
       console.error(error);
@@ -1837,6 +1877,146 @@ ${activeTab.content.slice(0, 18000)}`
     }
   }, [activeTab, addCommandHistory, externalSaveDirUri, saveCopyName]);
 
+  const loadExternalDirectoryEntries = useCallback(async (directoryUri: string) => {
+    setExternalBrowserBusy(true);
+    try {
+      const children = await FileSystem.StorageAccessFramework.readDirectoryAsync(directoryUri);
+      const mapped = await Promise.all(
+        children.map(async (uri) => {
+          let isDirectory = false;
+
+          try {
+            const info = await FileSystem.getInfoAsync(uri);
+            isDirectory = !!info.exists && !!info.isDirectory;
+          } catch {
+            isDirectory = false;
+          }
+
+          if (!isDirectory) {
+            try {
+              await FileSystem.StorageAccessFramework.readDirectoryAsync(uri);
+              isDirectory = true;
+            } catch {
+              isDirectory = false;
+            }
+          }
+
+          return {
+            uri,
+            name: decodeSafDisplayName(uri),
+            isDirectory,
+          } satisfies ExternalBrowserEntry;
+        }),
+      );
+
+      mapped.sort((left, right) => {
+        if (left.isDirectory !== right.isDirectory) {
+          return left.isDirectory ? -1 : 1;
+        }
+        return left.name.localeCompare(right.name);
+      });
+
+      setExternalBrowserEntries(mapped);
+    } catch (error) {
+      console.error(error);
+      setExternalBrowserEntries([]);
+      Alert.alert("External Folder", "Unable to read this folder.");
+    } finally {
+      setExternalBrowserBusy(false);
+    }
+  }, []);
+
+  const openExternalBrowser = useCallback(
+    async (targetUri?: string) => {
+      const startUri = targetUri || externalSaveDirUri;
+      if (!startUri) {
+        Alert.alert("External Folder", "Choose a folder first.");
+        return;
+      }
+      setExternalBrowserStack([startUri]);
+      setExternalBrowserVisible(true);
+      await loadExternalDirectoryEntries(startUri);
+    },
+    [externalSaveDirUri, loadExternalDirectoryEntries],
+  );
+
+  const navigateExternalBrowserTo = useCallback(
+    async (dirUri: string) => {
+      setExternalBrowserStack((prev) => [...prev, dirUri]);
+      await loadExternalDirectoryEntries(dirUri);
+    },
+    [loadExternalDirectoryEntries],
+  );
+
+  const navigateExternalBrowserBack = useCallback(async () => {
+    if (externalBrowserStack.length <= 1) {
+      return;
+    }
+    const nextStack = externalBrowserStack.slice(0, -1);
+    const nextDir = nextStack[nextStack.length - 1];
+    if (!nextDir) {
+      return;
+    }
+    setExternalBrowserStack(nextStack);
+    await loadExternalDirectoryEntries(nextDir);
+  }, [externalBrowserStack, loadExternalDirectoryEntries]);
+
+  const openExternalFile = useCallback(
+    async (uri: string) => {
+      try {
+        const content = await FileSystem.StorageAccessFramework.readAsStringAsync(uri, {
+          encoding: FileSystem.EncodingType.UTF8,
+        });
+
+        const name = decodeSafDisplayName(uri);
+        const existingTab = tabs.find((tab) => tab.path === uri);
+        if (existingTab) {
+          setActiveTabId(existingTab.id);
+          setScreen("editor");
+          await touchRecentFile(uri);
+          return;
+        }
+
+        let nextTabs = [...tabs];
+        if (nextTabs.length >= MAX_TABS) {
+          const removableIndex = nextTabs.findIndex(
+            (tab) => tab.id !== activeTabId && tab.content === tab.savedContent,
+          );
+          if (removableIndex === -1) {
+            Alert.alert(
+              "Tab Limit Reached",
+              "Close or save an existing tab before opening more files.",
+            );
+            return;
+          }
+          nextTabs.splice(removableIndex, 1);
+        }
+
+        const tab: EditorTab = {
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          path: uri,
+          name,
+          language: detectLanguage(name),
+          content,
+          savedContent: content,
+          line: 1,
+          col: 1,
+        };
+
+        nextTabs = [...nextTabs, tab];
+        setTabs(nextTabs);
+        setActiveTabId(tab.id);
+        setScreen("editor");
+        setExternalBrowserVisible(false);
+        await touchRecentFile(uri);
+      } catch (error) {
+        console.error(error);
+        Alert.alert("External File", "Unable to open external file.");
+      }
+    },
+    [activeTabId, tabs, touchRecentFile],
+  );
+
   const goToLine = useCallback(
     async (lineText: string) => {
       if (!activeTab) {
@@ -1868,9 +2048,6 @@ ${activeTab.content.slice(0, 18000)}`
     }
 
     for (const item of recents) {
-      if (!pathIsWithin(item.path, WORKSPACE_ROOT)) {
-        continue;
-      }
       pool.set(item.path, { path: item.path, name: item.name });
     }
 
@@ -2887,47 +3064,9 @@ ${activeTab.content.slice(0, 18000)}`
     <View style={styles.screen}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>[IPCoder]</Text>
-        <ScrollView
-          horizontal
-          style={styles.headerActionsScroll}
-          contentContainerStyle={styles.headerActions}
-          showsHorizontalScrollIndicator={false}
-        >
-          <Pressable style={styles.headerButton} onPress={() => setNewFileModalVisible(true)}>
-            <Text style={styles.headerButtonText}>[+] New File</Text>
-          </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => setNewFolderModalVisible(true)}>
-            <Text style={styles.headerButtonText}>[+] New Folder</Text>
-          </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => setCommandPaletteVisible(true)}>
-            <Text style={styles.headerButtonText}>[Cmd]</Text>
-          </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => setWorkspaceSearchVisible(true)}>
-            <Text style={styles.headerButtonText}>[Search+]</Text>
-          </Pressable>
-          <Pressable
-            style={styles.headerButton}
-            onPress={() => {
-              if (tabs.length) {
-                setScreen("editor");
-              }
-            }}
-          >
-            <Text style={styles.headerButtonText}>[Editor]</Text>
-          </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => setTrackerVisible(true)}>
-            <Text style={styles.headerButtonText}>[Tracker]</Text>
-          </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => setTerminalVisible(true)}>
-            <Text style={styles.headerButtonText}>[Terminal]</Text>
-          </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => setAiVisible(true)}>
-            <Text style={styles.headerButtonText}>[AI]</Text>
-          </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => setScreen("settings")}> 
-            <Text style={styles.headerButtonText}>[Settings]</Text>
-          </Pressable>
-        </ScrollView>
+        <Pressable style={styles.headerButton} onPress={() => setMenuVisible(true)}>
+          <Text style={styles.headerButtonText}>[MENU]</Text>
+        </Pressable>
       </View>
 
       <ScrollView style={styles.scrollArea}>
@@ -2940,6 +3079,10 @@ ${activeTab.content.slice(0, 18000)}`
               key={item.path}
               style={styles.fileRow}
               onPress={() => {
+                if (item.path.startsWith("content://")) {
+                  void openExternalFile(item.path);
+                  return;
+                }
                 if (isInsideRoot(item.path, WORKSPACE_ROOT)) {
                   void openFile(item.path);
                   return;
@@ -2979,6 +3122,27 @@ ${activeTab.content.slice(0, 18000)}`
             ))}
           </>
         ) : null}
+
+        <Text style={styles.sectionLabel}>External Folder Mount</Text>
+        {externalSaveDirUri ? (
+          <Pressable
+            style={styles.fileRow}
+            onPress={() => {
+              void openExternalBrowser(externalSaveDirUri);
+            }}
+            onLongPress={() => {
+              void pickExternalSaveDirectory();
+            }}
+          >
+            <Text style={styles.fileRowDirectory}>[EXT] Mounted Folder</Text>
+            <Text style={styles.fileRowPath}>{externalSaveDirUri}</Text>
+          </Pressable>
+        ) : (
+          <Text style={styles.emptyText}>No external folder mounted.</Text>
+        )}
+        <Pressable style={styles.selectionToggle} onPress={() => void pickExternalSaveDirectory()}>
+          <Text style={styles.selectionToggleText}>[Choose/Change External Folder]</Text>
+        </Pressable>
 
         {selectionMode ? (
           <View style={styles.bulkBar}>
@@ -3165,40 +3329,14 @@ ${activeTab.content.slice(0, 18000)}`
     <View style={styles.screen}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>[IPCoder]</Text>
-        <ScrollView
-          horizontal
-          style={styles.headerActionsScroll}
-          contentContainerStyle={styles.headerActions}
-          showsHorizontalScrollIndicator={false}
-        >
-          <Pressable style={styles.headerButton} onPress={() => setScreen("home")}> 
-            <Text style={styles.headerButtonText}>[Files]</Text>
-          </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => setCommandPaletteVisible(true)}>
-            <Text style={styles.headerButtonText}>[Cmd]</Text>
-          </Pressable>
+        <View style={styles.headerCompactActions}>
           <Pressable style={styles.headerButton} onPress={() => void saveActiveTab()}>
-            <Text style={styles.headerButtonText}>[Save]</Text>
+            <Text style={styles.headerButtonText}>[SAVE]</Text>
           </Pressable>
-          <Pressable
-            style={styles.headerButton}
-            onPress={() => {
-              setSaveCopyName(activeTab?.name ?? "untitled.txt");
-              setSaveCopyModalVisible(true);
-            }}
-          >
-            <Text style={styles.headerButtonText}>[Save Copy]</Text>
+          <Pressable style={styles.headerButton} onPress={() => setMenuVisible(true)}>
+            <Text style={styles.headerButtonText}>[MENU]</Text>
           </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => setSnippetVisible(true)}>
-            <Text style={styles.headerButtonText}>[Snippet]</Text>
-          </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => setAiVisible(true)}>
-            <Text style={styles.headerButtonText}>[AI]</Text>
-          </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => setScreen("settings")}> 
-            <Text style={styles.headerButtonText}>[Settings]</Text>
-          </Pressable>
-        </ScrollView>
+        </View>
       </View>
 
       <ScrollView horizontal style={styles.tabStrip} contentContainerStyle={styles.tabStripContent}>
@@ -3309,16 +3447,14 @@ ${activeTab.content.slice(0, 18000)}`
     <View style={styles.screen}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>[Settings]</Text>
-        <ScrollView
-          horizontal
-          style={styles.headerActionsScroll}
-          contentContainerStyle={styles.headerActions}
-          showsHorizontalScrollIndicator={false}
-        >
+        <View style={styles.headerCompactActions}>
           <Pressable style={styles.headerButton} onPress={() => setScreen("home")}> 
-            <Text style={styles.headerButtonText}>[Back]</Text>
+            <Text style={styles.headerButtonText}>[FILES]</Text>
           </Pressable>
-        </ScrollView>
+          <Pressable style={styles.headerButton} onPress={() => setMenuVisible(true)}>
+            <Text style={styles.headerButtonText}>[MENU]</Text>
+          </Pressable>
+        </View>
       </View>
 
       <ScrollView style={styles.scrollArea}>
@@ -3390,6 +3526,9 @@ ${activeTab.content.slice(0, 18000)}`
           <View style={styles.settingActionRow}>
             <Pressable style={styles.modalButtonPrimary} onPress={() => void pickExternalSaveDirectory()}>
               <Text style={styles.modalButtonPrimaryText}>Choose Folder</Text>
+            </Pressable>
+            <Pressable style={styles.modalButton} onPress={() => void openExternalBrowser()}>
+              <Text style={styles.modalButtonText}>Browse Folder</Text>
             </Pressable>
           </View>
         </View>
@@ -3521,6 +3660,146 @@ ${activeTab.content.slice(0, 18000)}`
       {screen === "home" ? renderHomeScreen() : null}
       {screen === "editor" ? renderEditorScreen() : null}
       {screen === "settings" ? renderSettingsScreen() : null}
+
+      <Modal visible={menuVisible} transparent animationType="none">
+        <View style={styles.drawerRoot}>
+          <Pressable style={styles.drawerScrim} onPress={() => setMenuVisible(false)} />
+          <View style={styles.drawerPanel}>
+            <Text style={styles.drawerTitle}>[MENU]</Text>
+            <ScrollView style={styles.drawerList}>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => {
+                  setMenuVisible(false);
+                  setScreen("home");
+                }}
+              >
+                <Text style={styles.drawerButtonText}>File Manager</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => {
+                  setMenuVisible(false);
+                  if (tabs.length) {
+                    setScreen("editor");
+                  }
+                }}
+              >
+                <Text style={styles.drawerButtonText}>Editor</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => {
+                  setMenuVisible(false);
+                  setScreen("settings");
+                }}
+              >
+                <Text style={styles.drawerButtonText}>Settings</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => {
+                  setMenuVisible(false);
+                  setNewFileModalVisible(true);
+                }}
+              >
+                <Text style={styles.drawerButtonText}>New File</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => {
+                  setMenuVisible(false);
+                  setNewFolderModalVisible(true);
+                }}
+              >
+                <Text style={styles.drawerButtonText}>New Folder</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => {
+                  setMenuVisible(false);
+                  setCommandPaletteVisible(true);
+                }}
+              >
+                <Text style={styles.drawerButtonText}>Command Palette</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => {
+                  setMenuVisible(false);
+                  setWorkspaceSearchVisible(true);
+                }}
+              >
+                <Text style={styles.drawerButtonText}>Workspace Search</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => {
+                  setMenuVisible(false);
+                  setTrackerVisible(true);
+                }}
+              >
+                <Text style={styles.drawerButtonText}>Tracker</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => {
+                  setMenuVisible(false);
+                  setTerminalVisible(true);
+                }}
+              >
+                <Text style={styles.drawerButtonText}>Terminal</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => {
+                  setMenuVisible(false);
+                  setAiVisible(true);
+                }}
+              >
+                <Text style={styles.drawerButtonText}>AI Assistant</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => {
+                  setMenuVisible(false);
+                  void saveActiveTab();
+                }}
+              >
+                <Text style={styles.drawerButtonText}>Save Active File</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => {
+                  setMenuVisible(false);
+                  setSaveCopyName(activeTab?.name ?? "untitled.txt");
+                  setSaveCopyModalVisible(true);
+                }}
+              >
+                <Text style={styles.drawerButtonText}>Save Copy To Folder</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => {
+                  setMenuVisible(false);
+                  void pickExternalSaveDirectory();
+                }}
+              >
+                <Text style={styles.drawerButtonText}>Choose External Folder</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => {
+                  setMenuVisible(false);
+                  void openExternalBrowser();
+                }}
+              >
+                <Text style={styles.drawerButtonText}>Browse External Folder</Text>
+              </Pressable>
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
 
       <Modal
         visible={entryActionModalVisible && !!selectedEntry}
@@ -3841,7 +4120,11 @@ ${activeTab.content.slice(0, 18000)}`
                     key={item.path}
                     style={styles.modalListRow}
                     onPress={() => {
-                      void openFile(item.path);
+                      if (item.path.startsWith("content://")) {
+                        void openExternalFile(item.path);
+                      } else {
+                        void openFile(item.path);
+                      }
                       setCommandPaletteVisible(false);
                       setCommandQuery("");
                     }}
@@ -4180,6 +4463,70 @@ ${activeTab.content.slice(0, 18000)}`
         </View>
       </Modal>
 
+      <Modal visible={externalBrowserVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>External Folder Browser</Text>
+            <Text style={styles.modalPath}>
+              {externalBrowserStack[externalBrowserStack.length - 1] || externalSaveDirUri}
+            </Text>
+
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButton} onPress={() => void navigateExternalBrowserBack()}>
+                <Text style={styles.modalButtonText}>Back</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  const current = externalBrowserStack[externalBrowserStack.length - 1];
+                  if (current) {
+                    void loadExternalDirectoryEntries(current);
+                  }
+                }}
+              >
+                <Text style={styles.modalButtonText}>Refresh</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => setExternalBrowserVisible(false)}
+              >
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+
+            {externalBrowserBusy ? (
+              <Text style={styles.searchBusyText}>Loading folder...</Text>
+            ) : null}
+
+            <ScrollView style={styles.modalList}>
+              {externalBrowserEntries.length ? (
+                externalBrowserEntries.map((entry) => (
+                  <Pressable
+                    key={entry.uri}
+                    style={styles.modalListRow}
+                    onPress={() => {
+                      if (entry.isDirectory) {
+                        void navigateExternalBrowserTo(entry.uri);
+                        return;
+                      }
+                      void openExternalFile(entry.uri);
+                    }}
+                  >
+                    <Text style={styles.modalListRowTitle}>
+                      {entry.isDirectory ? "[DIR] " : ""}
+                      {entry.name}
+                    </Text>
+                    <Text style={styles.modalListRowPath}>{entry.uri}</Text>
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>Folder is empty or unreadable.</Text>
+              )}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
       <Modal visible={aiVisible} transparent animationType="none">
         <View style={styles.modalBackdrop}>
           <View style={[styles.modalCard, styles.modalCardTall]}>
@@ -4319,6 +4666,11 @@ const styles = StyleSheet.create({
   headerActionsScroll: {
     flex: 1,
     marginLeft: 10,
+  },
+  headerCompactActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
   },
   headerButton: {
     paddingHorizontal: 8,
@@ -4798,6 +5150,45 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     pointerEvents: "box-none",
+  },
+  drawerRoot: {
+    flex: 1,
+    flexDirection: "row",
+    backgroundColor: "rgba(0,0,0,0.7)",
+  },
+  drawerScrim: {
+    flex: 1,
+  },
+  drawerPanel: {
+    width: 260,
+    borderLeftWidth: 1,
+    borderLeftColor: "#555555",
+    backgroundColor: "#000000",
+    paddingTop: 18,
+    paddingBottom: 16,
+    paddingHorizontal: 10,
+  },
+  drawerTitle: {
+    color: "#FFFFFF",
+    fontFamily: "SpaceGrotesk_700Bold",
+    fontSize: 16,
+    marginBottom: 10,
+  },
+  drawerList: {
+    flex: 1,
+  },
+  drawerButton: {
+    borderWidth: 1,
+    borderColor: "#555555",
+    backgroundColor: "#000000",
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    marginBottom: 8,
+  },
+  drawerButtonText: {
+    color: "#00FF41",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 12,
   },
   modalBackdrop: {
     flex: 1,
