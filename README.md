@@ -28,6 +28,8 @@ Offline-first mobile code editor for Android built with React Native (Expo) and 
 - Snippet library + plugin-provided insert snippets
 - Path protection + read-only mode guardrails
 - Lightweight outline panel + minimap preview
+- Online AI assistant panel (OpenAI API key + model, prompt history, apply AI output to editor)
+- Save Copy flow to Android local storage / SD card folders via SAF directory permissions
 - Bottom status bar: language, UTF-8, tab size, Ln/Col
 - Settings screen with categorized toggles and reset-to-defaults
 
@@ -56,6 +58,11 @@ npm run android
 ```
 
 `npm run android` and `npm start` automatically regenerate the local CodeMirror bundle.
+
+## AI Notes
+
+- AI is optional and requires internet access plus your own OpenAI API key.
+- Key/model are stored locally in app settings on the device.
 
 ## Flight Mode Verification
 

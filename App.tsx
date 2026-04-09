@@ -64,6 +64,8 @@ interface AppSettings {
   fontSize: number;
   lineNumbers: boolean;
   showHiddenFiles: boolean;
+  aiModel: string;
+  aiApiKey: string;
 }
 
 interface FileEntry {
@@ -162,6 +164,13 @@ interface LocalPlugin {
   commands: PluginCommand[];
 }
 
+interface AiMessage {
+  id: string;
+  role: "user" | "assistant" | "error";
+  content: string;
+  timestamp: number;
+}
+
 const STORAGE_SETTINGS_KEY = "ipcoder.settings.v1";
 const STORAGE_RECENTS_KEY = "ipcoder.recents.v1";
 const STORAGE_SESSION_KEY = "ipcoder.session.v1";
@@ -169,6 +178,7 @@ const STORAGE_COMMAND_HISTORY_KEY = "ipcoder.command-history.v1";
 const STORAGE_TRACKER_KEY = "ipcoder.tracker.v1";
 const STORAGE_PINNED_FOLDERS_KEY = "ipcoder.pinned-folders.v1";
 const STORAGE_PROTECTED_PATHS_KEY = "ipcoder.protected-paths.v1";
+const STORAGE_EXTERNAL_SAVE_DIR_KEY = "ipcoder.external-save-dir.v1";
 
 const DOCUMENT_ROOT =
   FileSystem.documentDirectory ?? FileSystem.cacheDirectory ?? "file:///tmp";
@@ -179,6 +189,7 @@ const MAX_TABS = 8;
 const MAX_COMMAND_HISTORY = 30;
 const MAX_SEARCH_RESULTS = 200;
 const MAX_TERMINAL_LINES = 250;
+const MAX_AI_MESSAGES = 40;
 
 const THEME_ORDER: EditorTheme[] = ["one-dark", "dracula", "github-light"];
 
@@ -189,6 +200,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   fontSize: 13,
   lineNumbers: true,
   showHiddenFiles: false,
+  aiModel: "gpt-4.1-mini",
+  aiApiKey: "",
 };
 
 const DEFAULT_SEARCH_STATE: SearchState = {
@@ -504,6 +517,89 @@ const quickHash = (value: string) => {
   return `h${(hash >>> 0).toString(16)}`;
 };
 
+const extensionFromName = (name: string) => {
+  const clean = name.trim();
+  const dot = clean.lastIndexOf(".");
+  if (dot <= 0 || dot === clean.length - 1) {
+    return "";
+  }
+  return clean.slice(dot + 1).toLowerCase();
+};
+
+const fileNameWithoutExtension = (name: string) => {
+  const clean = name.trim();
+  const dot = clean.lastIndexOf(".");
+  if (dot <= 0) {
+    return clean;
+  }
+  return clean.slice(0, dot);
+};
+
+const mimeTypeForFileName = (name: string) => {
+  const extension = extensionFromName(name);
+  switch (extension) {
+    case "js":
+      return "application/javascript";
+    case "ts":
+      return "application/typescript";
+    case "json":
+      return "application/json";
+    case "html":
+      return "text/html";
+    case "css":
+      return "text/css";
+    case "md":
+    case "markdown":
+      return "text/markdown";
+    case "py":
+      return "text/x-python";
+    case "sh":
+      return "application/x-sh";
+    case "sql":
+      return "application/sql";
+    case "xml":
+      return "application/xml";
+    case "yml":
+    case "yaml":
+      return "application/yaml";
+    case "txt":
+      return "text/plain";
+    default:
+      return "text/plain";
+  }
+};
+
+const coerceAssistantMessage = (content: unknown): string => {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") {
+          return part;
+        }
+        if (part && typeof part === "object") {
+          const maybeText = (part as { text?: unknown }).text;
+          return typeof maybeText === "string" ? maybeText : "";
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+  return "";
+};
+
+const extractFirstCodeBlock = (value: string) => {
+  const match = value.match(/```(?:[\w#+.-]+)?\n([\s\S]*?)```/);
+  if (!match) {
+    return null;
+  }
+  return match[1].trim();
+};
+
 function IPCoderApp() {
   const webviewRef = useRef<WebView>(null);
   const syncedTabForWebViewRef = useRef<string | null>(null);
@@ -567,6 +663,15 @@ function IPCoderApp() {
   const [readOnlyMode, setReadOnlyMode] = useState<boolean>(false);
   const [protectedPaths, setProtectedPaths] = useState<string[]>([]);
   const [plugins, setPlugins] = useState<LocalPlugin[]>([]);
+  const [aiVisible, setAiVisible] = useState<boolean>(false);
+  const [aiPrompt, setAiPrompt] = useState<string>("");
+  const [aiMessages, setAiMessages] = useState<AiMessage[]>([]);
+  const [aiBusy, setAiBusy] = useState<boolean>(false);
+  const [aiApiKeyDraft, setAiApiKeyDraft] = useState<string>(DEFAULT_SETTINGS.aiApiKey);
+  const [aiModelDraft, setAiModelDraft] = useState<string>(DEFAULT_SETTINGS.aiModel);
+  const [saveCopyModalVisible, setSaveCopyModalVisible] = useState<boolean>(false);
+  const [saveCopyName, setSaveCopyName] = useState<string>("");
+  const [externalSaveDirUri, setExternalSaveDirUri] = useState<string>("");
 
   const activeTab = useMemo(
     () => tabs.find((tab) => tab.id === activeTabId) ?? null,
@@ -958,6 +1063,7 @@ function IPCoderApp() {
           savedTrackerRaw,
           savedPinnedRaw,
           savedProtectedRaw,
+          savedExternalSaveDirRaw,
         ] = await Promise.all([
           AsyncStorage.getItem(STORAGE_SETTINGS_KEY),
           AsyncStorage.getItem(STORAGE_RECENTS_KEY),
@@ -966,12 +1072,16 @@ function IPCoderApp() {
           AsyncStorage.getItem(STORAGE_TRACKER_KEY),
           AsyncStorage.getItem(STORAGE_PINNED_FOLDERS_KEY),
           AsyncStorage.getItem(STORAGE_PROTECTED_PATHS_KEY),
+          AsyncStorage.getItem(STORAGE_EXTERNAL_SAVE_DIR_KEY),
         ]);
 
         if (savedSettingsRaw) {
           const parsed = JSON.parse(savedSettingsRaw) as Partial<AppSettings>;
           if (!cancelled) {
-            setSettings({ ...DEFAULT_SETTINGS, ...parsed });
+            const merged = { ...DEFAULT_SETTINGS, ...parsed };
+            setSettings(merged);
+            setAiApiKeyDraft(merged.aiApiKey);
+            setAiModelDraft(merged.aiModel);
           }
         }
 
@@ -1044,6 +1154,10 @@ function IPCoderApp() {
               ),
             );
           }
+        }
+
+        if (savedExternalSaveDirRaw && !cancelled) {
+          setExternalSaveDirUri(savedExternalSaveDirRaw);
         }
 
         await createWorkspaceIfMissing();
@@ -1142,6 +1256,11 @@ function IPCoderApp() {
       clearTimeout(timeout);
     };
   }, [activeTabId, currentDirectory, sessionHydrated, tabs]);
+
+  useEffect(() => {
+    setAiApiKeyDraft(settings.aiApiKey);
+    setAiModelDraft(settings.aiModel);
+  }, [settings.aiApiKey, settings.aiModel]);
 
   useEffect(() => {
     if (!editorReady) {
@@ -1488,6 +1607,235 @@ function IPCoderApp() {
     },
     [activeTab, applyActiveTabContent],
   );
+
+  const pushAiMessage = useCallback((role: AiMessage["role"], content: string) => {
+    setAiMessages((prev) =>
+      [
+        ...prev,
+        {
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          role,
+          content,
+          timestamp: Date.now(),
+        },
+      ].slice(-MAX_AI_MESSAGES),
+    );
+  }, []);
+
+  const saveAiConfiguration = useCallback(async () => {
+    const nextModel = aiModelDraft.trim() || DEFAULT_SETTINGS.aiModel;
+    const nextKey = aiApiKeyDraft.trim();
+    await persistSettings({
+      ...settings,
+      aiModel: nextModel,
+      aiApiKey: nextKey,
+    });
+    Alert.alert("AI Settings", "AI model and API key saved locally.");
+  }, [aiApiKeyDraft, aiModelDraft, persistSettings, settings]);
+
+  const askAi = useCallback(async () => {
+    if (aiBusy) {
+      return;
+    }
+    const prompt = aiPrompt.trim();
+    if (!prompt) {
+      Alert.alert("AI", "Enter a prompt first.");
+      return;
+    }
+    if (!settings.aiApiKey.trim()) {
+      Alert.alert("AI", "Set your OpenAI API key in AI settings.");
+      return;
+    }
+
+    const model = settings.aiModel.trim() || DEFAULT_SETTINGS.aiModel;
+    const contextBlock = activeTab
+      ? `Active file: ${activeTab.name}
+Path: ${formatRelativePath(activeTab.path)}
+Language: ${activeTab.language}
+Cursor: Ln ${activeTab.line}, Col ${activeTab.col}
+
+File content:
+${activeTab.content.slice(0, 18000)}`
+      : "No file is currently open.";
+
+    const userMessage = prompt;
+    setAiPrompt("");
+    pushAiMessage("user", userMessage);
+    setAiBusy(true);
+
+    try {
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${settings.aiApiKey.trim()}`,
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.2,
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are IPCoder AI assistant. Be concise and practical. When producing code, prefer fenced code blocks.",
+            },
+            {
+              role: "user",
+              content: `Editor context:\n${contextBlock}`,
+            },
+            ...aiMessages
+              .slice(-10)
+              .filter((message) => message.role === "user" || message.role === "assistant")
+              .map((message) => ({
+                role: message.role,
+                content: message.content,
+              })),
+            {
+              role: "user",
+              content: userMessage,
+            },
+          ],
+        }),
+      });
+
+      const payload = (await response.json()) as {
+        choices?: Array<{
+          message?: {
+            content?: unknown;
+          };
+        }>;
+        error?: { message?: string };
+      };
+
+      if (!response.ok) {
+        throw new Error(payload.error?.message ?? `HTTP ${response.status}`);
+      }
+
+      const content = coerceAssistantMessage(payload.choices?.[0]?.message?.content);
+      if (!content) {
+        throw new Error("Empty AI response.");
+      }
+
+      pushAiMessage("assistant", content);
+      await addCommandHistory(`AI Ask: ${userMessage.slice(0, 48)}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Request failed.";
+      pushAiMessage("error", message);
+    } finally {
+      setAiBusy(false);
+    }
+  }, [
+    activeTab,
+    addCommandHistory,
+    aiBusy,
+    aiMessages,
+    aiPrompt,
+    pushAiMessage,
+    settings.aiApiKey,
+    settings.aiModel,
+  ]);
+
+  const latestAssistantReply = useMemo(
+    () =>
+      [...aiMessages]
+        .reverse()
+        .find((message) => message.role === "assistant")?.content ?? "",
+    [aiMessages],
+  );
+
+  const applyLatestAiCode = useCallback(
+    async (replaceDocument: boolean) => {
+      if (!latestAssistantReply) {
+        Alert.alert("AI", "No assistant reply available.");
+        return;
+      }
+      if (!activeTab) {
+        Alert.alert("AI", "Open a file before applying AI output.");
+        return;
+      }
+
+      const extracted = extractFirstCodeBlock(latestAssistantReply);
+      const contentToApply = extracted ?? latestAssistantReply;
+      if (!contentToApply.trim()) {
+        Alert.alert("AI", "No applicable content found.");
+        return;
+      }
+
+      const nextContent = replaceDocument
+        ? contentToApply
+        : `${activeTab.content}${activeTab.content.endsWith("\n") ? "" : "\n"}${contentToApply}\n`;
+      await applyActiveTabContent(
+        nextContent,
+        replaceDocument ? "AI Replace Document" : "AI Insert Output",
+      );
+    },
+    [activeTab, applyActiveTabContent, latestAssistantReply],
+  );
+
+  const pickExternalSaveDirectory = useCallback(async () => {
+    if (Platform.OS !== "android") {
+      Alert.alert("Save Copy", "Custom folder picker is currently supported on Android.");
+      return;
+    }
+
+    try {
+      const result = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync(
+        externalSaveDirUri || null,
+      );
+      if (!result.granted) {
+        return;
+      }
+      setExternalSaveDirUri(result.directoryUri);
+      await AsyncStorage.setItem(STORAGE_EXTERNAL_SAVE_DIR_KEY, result.directoryUri);
+    } catch (error) {
+      console.error(error);
+      Alert.alert("Save Copy", "Unable to request folder access.");
+    }
+  }, [externalSaveDirUri]);
+
+  const saveCopyToExternalDirectory = useCallback(async () => {
+    if (!activeTab) {
+      Alert.alert("Save Copy", "Open a file first.");
+      return;
+    }
+    if (!externalSaveDirUri) {
+      Alert.alert("Save Copy", "Choose a target folder first.");
+      return;
+    }
+
+    const requestedName = saveCopyName.trim() || activeTab.name;
+    const baseName = fileNameWithoutExtension(requestedName) || "untitled";
+    const mimeType = mimeTypeForFileName(requestedName);
+
+    try {
+      let fileUri = "";
+      try {
+        fileUri = await FileSystem.StorageAccessFramework.createFileAsync(
+          externalSaveDirUri,
+          baseName,
+          mimeType,
+        );
+      } catch {
+        fileUri = await FileSystem.StorageAccessFramework.createFileAsync(
+          externalSaveDirUri,
+          `${baseName}-${Date.now()}`,
+          mimeType,
+        );
+      }
+
+      const finalContent = activeTab.content;
+      await FileSystem.StorageAccessFramework.writeAsStringAsync(fileUri, finalContent, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+
+      setSaveCopyModalVisible(false);
+      await addCommandHistory(`Save Copy ${requestedName}`);
+      Alert.alert("Save Copy", "File copy saved to selected folder.");
+    } catch (error) {
+      console.error(error);
+      Alert.alert("Save Copy", "Failed to save copy to selected folder.");
+    }
+  }, [activeTab, addCommandHistory, externalSaveDirUri, saveCopyName]);
 
   const goToLine = useCallback(
     async (lineText: string) => {
@@ -2573,6 +2921,9 @@ function IPCoderApp() {
           <Pressable style={styles.headerButton} onPress={() => setTerminalVisible(true)}>
             <Text style={styles.headerButtonText}>[Terminal]</Text>
           </Pressable>
+          <Pressable style={styles.headerButton} onPress={() => setAiVisible(true)}>
+            <Text style={styles.headerButtonText}>[AI]</Text>
+          </Pressable>
           <Pressable style={styles.headerButton} onPress={() => setScreen("settings")}> 
             <Text style={styles.headerButtonText}>[Settings]</Text>
           </Pressable>
@@ -2795,6 +3146,7 @@ function IPCoderApp() {
           })}
           {renderToolbarButton("Snippet", () => setSnippetVisible(true))}
           {renderToolbarButton("Cmd", () => setCommandPaletteVisible(true))}
+          {renderToolbarButton("AI", () => setAiVisible(true))}
           {renderToolbarButton(`Outline ${outlineVisible ? "ON" : "OFF"}`, () =>
             setOutlineVisible((prev) => !prev),
           )}
@@ -2828,8 +3180,20 @@ function IPCoderApp() {
           <Pressable style={styles.headerButton} onPress={() => void saveActiveTab()}>
             <Text style={styles.headerButtonText}>[Save]</Text>
           </Pressable>
+          <Pressable
+            style={styles.headerButton}
+            onPress={() => {
+              setSaveCopyName(activeTab?.name ?? "untitled.txt");
+              setSaveCopyModalVisible(true);
+            }}
+          >
+            <Text style={styles.headerButtonText}>[Save Copy]</Text>
+          </Pressable>
           <Pressable style={styles.headerButton} onPress={() => setSnippetVisible(true)}>
             <Text style={styles.headerButtonText}>[Snippet]</Text>
+          </Pressable>
+          <Pressable style={styles.headerButton} onPress={() => setAiVisible(true)}>
+            <Text style={styles.headerButtonText}>[AI]</Text>
           </Pressable>
           <Pressable style={styles.headerButton} onPress={() => setScreen("settings")}> 
             <Text style={styles.headerButtonText}>[Settings]</Text>
@@ -2980,6 +3344,55 @@ function IPCoderApp() {
         <Pressable style={styles.settingRow} onPress={() => void cycleTheme()}> 
           <Text style={styles.settingLabel}>[ ] Theme ({settings.theme})</Text>
         </Pressable>
+
+        <Text style={styles.sectionLabel}>AI (Online)</Text>
+        <View style={styles.settingBlock}>
+          <Text style={styles.settingHint}>
+            OpenAI API key is stored locally on this device.
+          </Text>
+          <TextInput
+            style={styles.settingInput}
+            value={aiApiKeyDraft}
+            onChangeText={setAiApiKeyDraft}
+            autoCapitalize="none"
+            autoCorrect={false}
+            secureTextEntry
+            placeholder="OpenAI API key"
+            placeholderTextColor="#555555"
+          />
+          <TextInput
+            style={[styles.settingInput, styles.settingInputTopGap]}
+            value={aiModelDraft}
+            onChangeText={setAiModelDraft}
+            autoCapitalize="none"
+            autoCorrect={false}
+            placeholder="Model (e.g. gpt-4.1-mini)"
+            placeholderTextColor="#555555"
+          />
+          <View style={styles.settingActionRow}>
+            <Pressable style={styles.modalButtonPrimary} onPress={() => void saveAiConfiguration()}>
+              <Text style={styles.modalButtonPrimaryText}>Save AI Config</Text>
+            </Pressable>
+            <Pressable style={styles.modalButton} onPress={() => setAiVisible(true)}>
+              <Text style={styles.modalButtonText}>Open AI Panel</Text>
+            </Pressable>
+          </View>
+        </View>
+
+        <Text style={styles.sectionLabel}>External Save</Text>
+        <View style={styles.settingBlock}>
+          <Text style={styles.settingHint}>
+            Choose a folder in local storage or SD card for Save Copy.
+          </Text>
+          <Text style={styles.settingValue}>
+            {externalSaveDirUri || "No folder selected"}
+          </Text>
+          <View style={styles.settingActionRow}>
+            <Pressable style={styles.modalButtonPrimary} onPress={() => void pickExternalSaveDirectory()}>
+              <Text style={styles.modalButtonPrimaryText}>Choose Folder</Text>
+            </Pressable>
+          </View>
+        </View>
 
         <Text style={styles.sectionLabel}>System</Text>
         <Pressable style={styles.settingRow} onPress={() => void toggleSetting("showHiddenFiles")}> 
@@ -3399,6 +3812,25 @@ function IPCoderApp() {
               >
                 <Text style={styles.modalButtonText}>Terminal</Text>
               </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setAiVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>AI</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setSaveCopyName(activeTab?.name ?? "untitled.txt");
+                  setSaveCopyModalVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Save Copy</Text>
+              </Pressable>
             </ScrollView>
 
             <Text style={styles.modalSectionLabel}>Quick Open</Text>
@@ -3707,6 +4139,134 @@ function IPCoderApp() {
 
             <View style={styles.modalActions}>
               <Pressable style={styles.modalButton} onPress={() => setSnippetVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={saveCopyModalVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Save Copy</Text>
+            <Text style={styles.modalPath}>Target Folder</Text>
+            <Text style={styles.settingValue}>
+              {externalSaveDirUri || "No folder selected"}
+            </Text>
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButton} onPress={() => void pickExternalSaveDirectory()}>
+                <Text style={styles.modalButtonText}>Choose Folder</Text>
+              </Pressable>
+            </View>
+            <TextInput
+              style={[styles.modalInput, styles.modalInputTopGap]}
+              value={saveCopyName}
+              onChangeText={setSaveCopyName}
+              autoCapitalize="none"
+              autoCorrect={false}
+              placeholder="File name for copy"
+              placeholderTextColor="#555555"
+            />
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButton} onPress={() => setSaveCopyModalVisible(false)}>
+                <Text style={styles.modalButtonText}>Cancel</Text>
+              </Pressable>
+              <Pressable style={styles.modalButtonPrimary} onPress={() => void saveCopyToExternalDirectory()}>
+                <Text style={styles.modalButtonPrimaryText}>Save Copy</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={aiVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>AI Assistant (Online)</Text>
+
+            <Text style={styles.modalSectionLabel}>Model</Text>
+            <TextInput
+              style={styles.modalInput}
+              value={aiModelDraft}
+              onChangeText={setAiModelDraft}
+              autoCapitalize="none"
+              autoCorrect={false}
+              placeholder="gpt-4.1-mini"
+              placeholderTextColor="#555555"
+            />
+            <Text style={styles.modalSectionLabel}>API Key</Text>
+            <TextInput
+              style={styles.modalInput}
+              value={aiApiKeyDraft}
+              onChangeText={setAiApiKeyDraft}
+              autoCapitalize="none"
+              autoCorrect={false}
+              secureTextEntry
+              placeholder="sk-..."
+              placeholderTextColor="#555555"
+            />
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButton} onPress={() => void saveAiConfiguration()}>
+                <Text style={styles.modalButtonText}>Save Config</Text>
+              </Pressable>
+            </View>
+
+            <ScrollView style={styles.aiMessagesWrap}>
+              {aiMessages.length ? (
+                aiMessages.map((message) => (
+                  <View
+                    key={message.id}
+                    style={[
+                      styles.aiMessageRow,
+                      message.role === "user"
+                        ? styles.aiMessageUser
+                        : message.role === "assistant"
+                          ? styles.aiMessageAssistant
+                          : styles.aiMessageError,
+                    ]}
+                  >
+                    <Text style={styles.aiMessageRole}>
+                      {message.role === "user" ? "YOU" : message.role === "assistant" ? "AI" : "ERR"}
+                    </Text>
+                    <Text style={styles.aiMessageText}>{message.content}</Text>
+                  </View>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No AI messages yet.</Text>
+              )}
+            </ScrollView>
+
+            <TextInput
+              style={[styles.modalInput, styles.modalInputTopGap, styles.aiPromptInput]}
+              value={aiPrompt}
+              onChangeText={setAiPrompt}
+              autoCapitalize="none"
+              autoCorrect={false}
+              multiline
+              placeholder="Ask AI about the current file..."
+              placeholderTextColor="#555555"
+            />
+
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButton} onPress={() => setAiPrompt("Explain this file and suggest improvements.")}>
+                <Text style={styles.modalButtonText}>Explain</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setAiPrompt("Refactor this file for readability and maintainability.")}>
+                <Text style={styles.modalButtonText}>Refactor</Text>
+              </Pressable>
+              <Pressable style={styles.modalButtonPrimary} onPress={() => void askAi()}>
+                <Text style={styles.modalButtonPrimaryText}>{aiBusy ? "Working..." : "Ask AI"}</Text>
+              </Pressable>
+            </View>
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButton} onPress={() => void applyLatestAiCode(false)}>
+                <Text style={styles.modalButtonText}>Insert Reply</Text>
+              </Pressable>
+              <Pressable style={styles.modalButtonPrimary} onPress={() => void applyLatestAiCode(true)}>
+                <Text style={styles.modalButtonPrimaryText}>Replace File</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setAiVisible(false)}>
                 <Text style={styles.modalButtonText}>Close</Text>
               </Pressable>
             </View>
@@ -4140,6 +4700,44 @@ const styles = StyleSheet.create({
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 13,
   },
+  settingBlock: {
+    borderWidth: 1,
+    borderColor: "#555555",
+    marginHorizontal: 12,
+    marginBottom: 10,
+    padding: 10,
+    backgroundColor: "#000000",
+  },
+  settingHint: {
+    color: "#555555",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 11,
+    marginBottom: 8,
+  },
+  settingInput: {
+    borderWidth: 1,
+    borderColor: "#555555",
+    backgroundColor: "#000000",
+    color: "#FFFFFF",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+  },
+  settingInputTopGap: {
+    marginTop: 8,
+  },
+  settingActionRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginTop: 8,
+    flexWrap: "wrap",
+  },
+  settingValue: {
+    color: "#FFFFFF",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 11,
+  },
   pluginCard: {
     borderWidth: 1,
     borderColor: "#555555",
@@ -4380,6 +4978,44 @@ const styles = StyleSheet.create({
   },
   terminalLineInput: {
     color: "#00FF41",
+  },
+  aiMessagesWrap: {
+    borderWidth: 1,
+    borderColor: "#555555",
+    backgroundColor: "#000000",
+    marginTop: 8,
+    maxHeight: 240,
+  },
+  aiMessageRow: {
+    borderBottomWidth: 1,
+    borderBottomColor: "#555555",
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+  },
+  aiMessageUser: {
+    backgroundColor: "#111111",
+  },
+  aiMessageAssistant: {
+    backgroundColor: "#000000",
+  },
+  aiMessageError: {
+    backgroundColor: "#1A0000",
+  },
+  aiMessageRole: {
+    color: "#00FF41",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 10,
+    marginBottom: 4,
+  },
+  aiMessageText: {
+    color: "#FFFFFF",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  aiPromptInput: {
+    minHeight: 80,
+    textAlignVertical: "top",
   },
   actionMenuList: {
     gap: 8,
