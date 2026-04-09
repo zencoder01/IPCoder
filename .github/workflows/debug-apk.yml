@@ -51,6 +51,21 @@ jobs:
             mv android/build.gradle.tmp android/build.gradle
           fi
 
+      - name: Force JS bundle into debug APK
+        run: |
+          if ! grep -Fq 'debuggableVariants = []' android/app/build.gradle; then
+            awk '
+              /autolinkLibrariesWithApp\(\)/ {
+                print
+                print "    // CI debug APK must be self-contained (no Metro)."
+                print "    debuggableVariants = []"
+                next
+              }
+              {print}
+            ' android/app/build.gradle > android/app/build.gradle.tmp
+            mv android/app/build.gradle.tmp android/app/build.gradle
+          fi
+
       - name: Build debug APK
         working-directory: android
         run: |
