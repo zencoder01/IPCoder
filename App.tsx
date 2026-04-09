@@ -116,9 +116,59 @@ interface PersistedSession {
   timestamp: number;
 }
 
+interface CommandHistoryEntry {
+  id: string;
+  label: string;
+  timestamp: number;
+}
+
+interface WorkspaceSearchResult {
+  path: string;
+  line: number;
+  col: number;
+  snippet: string;
+}
+
+interface TrackerCommit {
+  id: string;
+  message: string;
+  timestamp: number;
+  files: string[];
+}
+
+interface TrackerState {
+  initialized: boolean;
+  trackedPaths: Record<string, string>;
+  stagedPaths: string[];
+  commits: TrackerCommit[];
+}
+
+interface TerminalLogEntry {
+  id: string;
+  type: "input" | "output" | "error";
+  text: string;
+}
+
+interface PluginCommand {
+  id: string;
+  label: string;
+  type: "insertText" | "openFile" | "showMessage";
+  payload: string;
+}
+
+interface LocalPlugin {
+  id: string;
+  name: string;
+  commands: PluginCommand[];
+}
+
 const STORAGE_SETTINGS_KEY = "ipcoder.settings.v1";
 const STORAGE_RECENTS_KEY = "ipcoder.recents.v1";
 const STORAGE_SESSION_KEY = "ipcoder.session.v1";
+const STORAGE_COMMAND_HISTORY_KEY = "ipcoder.command-history.v1";
+const STORAGE_TRACKER_KEY = "ipcoder.tracker.v1";
+const STORAGE_PINNED_FOLDERS_KEY = "ipcoder.pinned-folders.v1";
+const STORAGE_PROTECTED_PATHS_KEY = "ipcoder.protected-paths.v1";
 
 const DOCUMENT_ROOT =
   FileSystem.documentDirectory ?? FileSystem.cacheDirectory ?? "file:///tmp";
@@ -126,6 +176,9 @@ const WORKSPACE_ROOT = `${DOCUMENT_ROOT.replace(/\/$/, "")}/workspace`;
 
 const MAX_RECENT_FILES = 20;
 const MAX_TABS = 8;
+const MAX_COMMAND_HISTORY = 30;
+const MAX_SEARCH_RESULTS = 200;
+const MAX_TERMINAL_LINES = 250;
 
 const THEME_ORDER: EditorTheme[] = ["one-dark", "dracula", "github-light"];
 
@@ -145,6 +198,34 @@ const DEFAULT_SEARCH_STATE: SearchState = {
   regex: false,
   wholeWord: false,
 };
+
+const BUILTIN_SNIPPETS: Array<{ id: string; label: string; body: string }> = [
+  {
+    id: "js-function",
+    label: "JavaScript Function",
+    body: "\nfunction name(params) {\n  return;\n}\n",
+  },
+  {
+    id: "ts-interface",
+    label: "TypeScript Interface",
+    body: "\ninterface Name {\n  id: string;\n}\n",
+  },
+  {
+    id: "py-main",
+    label: "Python Main Guard",
+    body: "\nif __name__ == \"__main__\":\n    main()\n",
+  },
+  {
+    id: "react-component",
+    label: "React Component",
+    body: "\nexport function ComponentName() {\n  return <div />;\n}\n",
+  },
+  {
+    id: "bash-script",
+    label: "Bash Script Header",
+    body: "\n#!/usr/bin/env bash\nset -euo pipefail\n\n",
+  },
+];
 
 const stripTrailingSlash = (value: string) => value.replace(/\/+$/, "");
 
@@ -370,6 +451,59 @@ const coercePersistedTab = (value: unknown): PersistedSessionTab | null => {
   };
 };
 
+const textFileExtensions = new Set([
+  "js",
+  "jsx",
+  "mjs",
+  "cjs",
+  "ts",
+  "tsx",
+  "py",
+  "html",
+  "htm",
+  "css",
+  "scss",
+  "json",
+  "md",
+  "markdown",
+  "sql",
+  "sh",
+  "bash",
+  "c",
+  "h",
+  "cpp",
+  "cc",
+  "cxx",
+  "hpp",
+  "java",
+  "php",
+  "rs",
+  "go",
+  "txt",
+  "yaml",
+  "yml",
+  "xml",
+]);
+
+const isTextFilePath = (path: string) => {
+  const name = basename(path);
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0) {
+    return true;
+  }
+  return textFileExtensions.has(name.slice(dot + 1).toLowerCase());
+};
+
+const quickHash = (value: string) => {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash +=
+      (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+  }
+  return `h${(hash >>> 0).toString(16)}`;
+};
+
 function IPCoderApp() {
   const webviewRef = useRef<WebView>(null);
   const syncedTabForWebViewRef = useRef<string | null>(null);
@@ -404,6 +538,35 @@ function IPCoderApp() {
   const [renameModalVisible, setRenameModalVisible] = useState<boolean>(false);
   const [renameValue, setRenameValue] = useState<string>("");
   const [sessionHydrated, setSessionHydrated] = useState<boolean>(false);
+  const [commandPaletteVisible, setCommandPaletteVisible] = useState<boolean>(false);
+  const [commandQuery, setCommandQuery] = useState<string>("");
+  const [goToLineValue, setGoToLineValue] = useState<string>("");
+  const [commandHistory, setCommandHistory] = useState<CommandHistoryEntry[]>([]);
+  const [workspaceSearchVisible, setWorkspaceSearchVisible] = useState<boolean>(false);
+  const [workspaceSearchQuery, setWorkspaceSearchQuery] = useState<string>("");
+  const [workspaceReplaceValue, setWorkspaceReplaceValue] = useState<string>("");
+  const [workspaceSearchResults, setWorkspaceSearchResults] = useState<WorkspaceSearchResult[]>([]);
+  const [workspaceSearchBusy, setWorkspaceSearchBusy] = useState<boolean>(false);
+  const [trackerState, setTrackerState] = useState<TrackerState>({
+    initialized: false,
+    trackedPaths: {},
+    stagedPaths: [],
+    commits: [],
+  });
+  const [trackerVisible, setTrackerVisible] = useState<boolean>(false);
+  const [trackerCommitMessage, setTrackerCommitMessage] = useState<string>("");
+  const [terminalVisible, setTerminalVisible] = useState<boolean>(false);
+  const [terminalInput, setTerminalInput] = useState<string>("");
+  const [terminalLogs, setTerminalLogs] = useState<TerminalLogEntry[]>([]);
+  const [snippetVisible, setSnippetVisible] = useState<boolean>(false);
+  const [selectionMode, setSelectionMode] = useState<boolean>(false);
+  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+  const [pinnedFolders, setPinnedFolders] = useState<string[]>([]);
+  const [showMiniMap, setShowMiniMap] = useState<boolean>(false);
+  const [outlineVisible, setOutlineVisible] = useState<boolean>(false);
+  const [readOnlyMode, setReadOnlyMode] = useState<boolean>(false);
+  const [protectedPaths, setProtectedPaths] = useState<string[]>([]);
+  const [plugins, setPlugins] = useState<LocalPlugin[]>([]);
 
   const activeTab = useMemo(
     () => tabs.find((tab) => tab.id === activeTabId) ?? null,
@@ -432,6 +595,57 @@ function IPCoderApp() {
     await AsyncStorage.setItem(STORAGE_RECENTS_KEY, JSON.stringify(next));
   }, []);
 
+  const persistCommandHistory = useCallback(async (next: CommandHistoryEntry[]) => {
+    setCommandHistory(next);
+    await AsyncStorage.setItem(STORAGE_COMMAND_HISTORY_KEY, JSON.stringify(next));
+  }, []);
+
+  const persistTrackerState = useCallback(async (next: TrackerState) => {
+    setTrackerState(next);
+    await AsyncStorage.setItem(STORAGE_TRACKER_KEY, JSON.stringify(next));
+  }, []);
+
+  const persistPinnedFolders = useCallback(async (next: string[]) => {
+    const deduped = Array.from(new Set(next.filter((item) => pathIsWithin(item, WORKSPACE_ROOT))));
+    setPinnedFolders(deduped);
+    await AsyncStorage.setItem(STORAGE_PINNED_FOLDERS_KEY, JSON.stringify(deduped));
+  }, []);
+
+  const persistProtectedPaths = useCallback(async (next: string[]) => {
+    const deduped = Array.from(new Set(next.filter((item) => pathIsWithin(item, WORKSPACE_ROOT))));
+    setProtectedPaths(deduped);
+    await AsyncStorage.setItem(STORAGE_PROTECTED_PATHS_KEY, JSON.stringify(deduped));
+  }, []);
+
+  const addCommandHistory = useCallback(
+    async (label: string) => {
+      const next = [
+        {
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          label,
+          timestamp: Date.now(),
+        },
+        ...commandHistory.filter((entry) => entry.label !== label),
+      ].slice(0, MAX_COMMAND_HISTORY);
+      await persistCommandHistory(next);
+    },
+    [commandHistory, persistCommandHistory],
+  );
+
+  const appendTerminalLog = useCallback((type: TerminalLogEntry["type"], text: string) => {
+    setTerminalLogs((prev) => {
+      const next = [
+        ...prev,
+        {
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          type,
+          text,
+        },
+      ];
+      return next.slice(-MAX_TERMINAL_LINES);
+    });
+  }, []);
+
   const sendToEditor = useCallback((payload: Record<string, unknown>) => {
     if (!webviewRef.current) {
       return;
@@ -439,6 +653,91 @@ function IPCoderApp() {
 
     webviewRef.current.postMessage(JSON.stringify(payload));
   }, []);
+
+  const isProtectedPath = useCallback(
+    (path: string) => protectedPaths.some((item) => pathIsWithin(path, item)),
+    [protectedPaths],
+  );
+
+  const listWorkspaceFiles = useCallback(
+    async (startPath = WORKSPACE_ROOT) => {
+      const stack = [startPath];
+      const results: FileEntry[] = [];
+
+      while (stack.length) {
+        const current = stack.pop();
+        if (!current) {
+          continue;
+        }
+
+        let names: string[] = [];
+        try {
+          names = await FileSystem.readDirectoryAsync(current);
+        } catch {
+          continue;
+        }
+
+        for (const name of names) {
+          if (!settings.showHiddenFiles && name.startsWith(".")) {
+            continue;
+          }
+          const path = joinFsPath(current, name);
+          const info = await FileSystem.getInfoAsync(path);
+          if (!info.exists) {
+            continue;
+          }
+          const isDirectory = info.isDirectory ?? false;
+          const modifiedAt =
+            "modificationTime" in info && typeof info.modificationTime === "number"
+              ? info.modificationTime * 1000
+              : 0;
+
+          results.push({
+            path,
+            name,
+            isDirectory,
+            modifiedAt,
+          });
+
+          if (isDirectory) {
+            stack.push(path);
+          }
+        }
+      }
+
+      return results;
+    },
+    [settings.showHiddenFiles],
+  );
+
+  const readFileAsTextSafe = useCallback(async (path: string) => {
+    try {
+      if (!isTextFilePath(path)) {
+        return null;
+      }
+      const content = await FileSystem.readAsStringAsync(path, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+      return content;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const syncActiveTabToEditor = useCallback(
+    (tab: EditorTab) => {
+      syncedTabForWebViewRef.current = null;
+      sendToEditor({
+        type: "setDoc",
+        payload: {
+          doc: tab.content,
+          language: tab.language,
+        },
+      });
+      sendToEditor({ type: "requestState" });
+    },
+    [sendToEditor],
+  );
 
   const setCurrentTabContent = useCallback(
     (nextContent: string) => {
@@ -594,15 +893,79 @@ function IPCoderApp() {
     setJetbrainsFontBase64(fontBase64);
   }, []);
 
+  const loadLocalPlugins = useCallback(async () => {
+    const pluginsRoot = joinFsPath(WORKSPACE_ROOT, ".ipcoder/plugins");
+    await FileSystem.makeDirectoryAsync(pluginsRoot, { intermediates: true });
+
+    const files = await FileSystem.readDirectoryAsync(pluginsRoot);
+    const nextPlugins: LocalPlugin[] = [];
+
+    for (const name of files) {
+      if (!name.toLowerCase().endsWith(".json")) {
+        continue;
+      }
+
+      const path = joinFsPath(pluginsRoot, name);
+      const content = await readFileAsTextSafe(path);
+      if (!content) {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(content) as Partial<LocalPlugin>;
+        if (
+          typeof parsed.id !== "string" ||
+          typeof parsed.name !== "string" ||
+          !Array.isArray(parsed.commands)
+        ) {
+          continue;
+        }
+
+        const commands = parsed.commands.filter(
+          (cmd): cmd is PluginCommand =>
+            !!cmd &&
+            typeof cmd.id === "string" &&
+            typeof cmd.label === "string" &&
+            (cmd.type === "insertText" ||
+              cmd.type === "openFile" ||
+              cmd.type === "showMessage") &&
+            typeof cmd.payload === "string",
+        );
+
+        nextPlugins.push({
+          id: parsed.id,
+          name: parsed.name,
+          commands,
+        });
+      } catch {
+        continue;
+      }
+    }
+
+    setPlugins(nextPlugins);
+  }, [readFileAsTextSafe]);
+
   useEffect(() => {
     let cancelled = false;
 
     const bootstrap = async () => {
       try {
-        const [savedSettingsRaw, savedRecentsRaw, savedSessionRaw] = await Promise.all([
+        const [
+          savedSettingsRaw,
+          savedRecentsRaw,
+          savedSessionRaw,
+          savedCommandHistoryRaw,
+          savedTrackerRaw,
+          savedPinnedRaw,
+          savedProtectedRaw,
+        ] = await Promise.all([
           AsyncStorage.getItem(STORAGE_SETTINGS_KEY),
           AsyncStorage.getItem(STORAGE_RECENTS_KEY),
           AsyncStorage.getItem(STORAGE_SESSION_KEY),
+          AsyncStorage.getItem(STORAGE_COMMAND_HISTORY_KEY),
+          AsyncStorage.getItem(STORAGE_TRACKER_KEY),
+          AsyncStorage.getItem(STORAGE_PINNED_FOLDERS_KEY),
+          AsyncStorage.getItem(STORAGE_PROTECTED_PATHS_KEY),
         ]);
 
         if (savedSettingsRaw) {
@@ -619,7 +982,72 @@ function IPCoderApp() {
           }
         }
 
+        if (savedCommandHistoryRaw) {
+          const parsed = JSON.parse(savedCommandHistoryRaw) as CommandHistoryEntry[];
+          if (!cancelled && Array.isArray(parsed)) {
+            setCommandHistory(parsed.slice(0, MAX_COMMAND_HISTORY));
+          }
+        }
+
+        if (savedTrackerRaw) {
+          const parsed = JSON.parse(savedTrackerRaw) as Partial<TrackerState>;
+          if (!cancelled && parsed && typeof parsed === "object") {
+            setTrackerState({
+              initialized: !!parsed.initialized,
+              trackedPaths:
+                parsed.trackedPaths &&
+                typeof parsed.trackedPaths === "object" &&
+                !Array.isArray(parsed.trackedPaths)
+                  ? Object.fromEntries(
+                      Object.entries(parsed.trackedPaths).filter(
+                        (entry): entry is [string, string] =>
+                          typeof entry[0] === "string" && typeof entry[1] === "string",
+                      ),
+                    )
+                  : {},
+              stagedPaths: Array.isArray(parsed.stagedPaths)
+                ? parsed.stagedPaths.filter((path): path is string => typeof path === "string")
+                : [],
+              commits: Array.isArray(parsed.commits)
+                ? parsed.commits.filter(
+                    (commit): commit is TrackerCommit =>
+                      !!commit &&
+                      typeof commit.id === "string" &&
+                      typeof commit.message === "string" &&
+                      typeof commit.timestamp === "number" &&
+                      Array.isArray(commit.files),
+                  )
+                : [],
+            });
+          }
+        }
+
+        if (savedPinnedRaw) {
+          const parsed = JSON.parse(savedPinnedRaw) as string[];
+          if (!cancelled && Array.isArray(parsed)) {
+            setPinnedFolders(
+              parsed.filter(
+                (item): item is string =>
+                  typeof item === "string" && pathIsWithin(item, WORKSPACE_ROOT),
+              ),
+            );
+          }
+        }
+
+        if (savedProtectedRaw) {
+          const parsed = JSON.parse(savedProtectedRaw) as string[];
+          if (!cancelled && Array.isArray(parsed)) {
+            setProtectedPaths(
+              parsed.filter(
+                (item): item is string =>
+                  typeof item === "string" && pathIsWithin(item, WORKSPACE_ROOT),
+              ),
+            );
+          }
+        }
+
         await createWorkspaceIfMissing();
+        await loadLocalPlugins();
 
         if (savedSessionRaw) {
           const parsed = JSON.parse(savedSessionRaw) as Partial<PersistedSession>;
@@ -673,11 +1101,17 @@ function IPCoderApp() {
     return () => {
       cancelled = true;
     };
-  }, [createWorkspaceIfMissing, loadOfflineEditorAssets]);
+  }, [createWorkspaceIfMissing, loadLocalPlugins, loadOfflineEditorAssets]);
 
   useEffect(() => {
     void refreshCurrentDirectory();
   }, [refreshCurrentDirectory]);
+
+  useEffect(() => {
+    if (!selectionMode && selectedPaths.length) {
+      setSelectedPaths([]);
+    }
+  }, [selectedPaths.length, selectionMode]);
 
   useEffect(() => {
     if (!sessionHydrated) {
@@ -855,12 +1289,34 @@ function IPCoderApp() {
     [activeTabId, tabs, touchRecentFile],
   );
 
+  const backupFileIfNeeded = useCallback(async (path: string, content: string) => {
+    try {
+      const backupDir = joinFsPath(WORKSPACE_ROOT, ".ipcoder/backups");
+      await FileSystem.makeDirectoryAsync(backupDir, { intermediates: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const backupPath = joinFsPath(
+        backupDir,
+        `${basename(path)}.${stamp}.bak`,
+      );
+      await FileSystem.writeAsStringAsync(backupPath, content, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+    } catch {
+      // Backup errors should not block editor operations.
+    }
+  }, []);
+
   const saveActiveTab = useCallback(async () => {
     if (!activeTab) {
       return;
     }
+    if (readOnlyMode || isProtectedPath(activeTab.path)) {
+      Alert.alert("Read Only", "Current file is protected or read-only.");
+      return;
+    }
 
     try {
+      await backupFileIfNeeded(activeTab.path, activeTab.savedContent);
       await FileSystem.writeAsStringAsync(activeTab.path, activeTab.content, {
         encoding: FileSystem.EncodingType.UTF8,
       });
@@ -878,11 +1334,20 @@ function IPCoderApp() {
 
       await touchRecentFile(activeTab.path);
       await refreshCurrentDirectory();
+      await addCommandHistory(`Save ${activeTab.name}`);
     } catch (error) {
       console.error(error);
       Alert.alert("Save Error", "Unable to save the current file.");
     }
-  }, [activeTab, refreshCurrentDirectory, touchRecentFile]);
+  }, [
+    activeTab,
+    addCommandHistory,
+    backupFileIfNeeded,
+    isProtectedPath,
+    readOnlyMode,
+    refreshCurrentDirectory,
+    touchRecentFile,
+  ]);
 
   const closeTab = useCallback(
     (tabId: string) => {
@@ -934,6 +1399,10 @@ function IPCoderApp() {
     }
 
     const destination = joinFsPath(currentDirectory, trimmed);
+    if (readOnlyMode || isProtectedPath(destination)) {
+      Alert.alert("Read Only", "Target path is protected or read-only.");
+      return;
+    }
 
     try {
       const fileInfo = await FileSystem.getInfoAsync(destination);
@@ -951,11 +1420,732 @@ function IPCoderApp() {
 
       await refreshCurrentDirectory();
       await openFile(destination);
+      await addCommandHistory(`Create File ${trimmed}`);
     } catch (error) {
       console.error(error);
       Alert.alert("Create Error", "Unable to create the file.");
     }
-  }, [currentDirectory, newFileName, openFile, refreshCurrentDirectory]);
+  }, [
+    addCommandHistory,
+    currentDirectory,
+    isProtectedPath,
+    newFileName,
+    openFile,
+    readOnlyMode,
+    refreshCurrentDirectory,
+  ]);
+
+  const applyActiveTabContent = useCallback(
+    async (nextContent: string, actionLabel: string) => {
+      if (!activeTab) {
+        return;
+      }
+      if (readOnlyMode || isProtectedPath(activeTab.path)) {
+        Alert.alert("Read Only", "Current file is protected or read-only.");
+        return;
+      }
+
+      setTabs((prev) =>
+        prev.map((tab) =>
+          tab.id === activeTab.id
+            ? {
+                ...tab,
+                content: nextContent,
+              }
+            : tab,
+        ),
+      );
+
+      syncActiveTabToEditor({
+        ...activeTab,
+        content: nextContent,
+      });
+      await addCommandHistory(actionLabel);
+    },
+    [activeTab, addCommandHistory, isProtectedPath, readOnlyMode, syncActiveTabToEditor],
+  );
+
+  const formatActiveDocument = useCallback(async () => {
+    if (!activeTab) {
+      return;
+    }
+
+    const lines = activeTab.content.split("\n");
+    const trimmed = lines.map((line) => line.replace(/\s+$/g, ""));
+    const normalized = trimmed.join("\n").replace(/\t/g, " ".repeat(settings.tabSize));
+    const withTrailing = normalized.endsWith("\n") ? normalized : `${normalized}\n`;
+
+    await applyActiveTabContent(withTrailing, "Format Document");
+  }, [activeTab, applyActiveTabContent, settings.tabSize]);
+
+  const insertSnippetIntoActiveTab = useCallback(
+    async (snippet: string) => {
+      if (!activeTab) {
+        return;
+      }
+      await applyActiveTabContent(`${activeTab.content}${snippet}`, "Insert Snippet");
+      setSnippetVisible(false);
+    },
+    [activeTab, applyActiveTabContent],
+  );
+
+  const goToLine = useCallback(
+    async (lineText: string) => {
+      if (!activeTab) {
+        return;
+      }
+      const line = Math.max(1, Number.parseInt(lineText, 10) || 1);
+      sendToEditor({
+        type: "setCursor",
+        payload: {
+          line,
+          col: 1,
+        },
+      });
+      setCommandPaletteVisible(false);
+      setGoToLineValue("");
+      await addCommandHistory(`Go To Line ${line}`);
+    },
+    [activeTab, addCommandHistory, sendToEditor],
+  );
+
+  const quickOpenMatches = useMemo(() => {
+    const pool = new Map<string, { path: string; name: string }>();
+
+    for (const entry of entries) {
+      if (entry.isDirectory) {
+        continue;
+      }
+      pool.set(entry.path, { path: entry.path, name: entry.name });
+    }
+
+    for (const item of recents) {
+      if (!pathIsWithin(item.path, WORKSPACE_ROOT)) {
+        continue;
+      }
+      pool.set(item.path, { path: item.path, name: item.name });
+    }
+
+    for (const tab of tabs) {
+      pool.set(tab.path, { path: tab.path, name: tab.name });
+    }
+
+    const query = commandQuery.trim().toLowerCase();
+    const sorted = Array.from(pool.values()).sort((left, right) =>
+      left.name.localeCompare(right.name),
+    );
+
+    if (!query) {
+      return sorted.slice(0, 30);
+    }
+
+    return sorted
+      .filter(
+        (item) =>
+          item.name.toLowerCase().includes(query) ||
+          formatRelativePath(item.path).toLowerCase().includes(query),
+      )
+      .slice(0, 30);
+  }, [commandQuery, entries, recents, tabs]);
+
+  const pluginCommandMatches = useMemo(() => {
+    const query = commandQuery.trim().toLowerCase();
+    const flattened = plugins.flatMap((plugin) =>
+      plugin.commands.map((command) => ({
+        pluginId: plugin.id,
+        pluginName: plugin.name,
+        command,
+      })),
+    );
+
+    if (!query) {
+      return flattened.slice(0, 20);
+    }
+
+    return flattened
+      .filter(
+        (item) =>
+          item.command.label.toLowerCase().includes(query) ||
+          item.pluginName.toLowerCase().includes(query),
+      )
+      .slice(0, 20);
+  }, [commandQuery, plugins]);
+
+  const pluginInsertCommands = useMemo(
+    () =>
+      plugins.flatMap((plugin) =>
+        plugin.commands
+          .filter((command) => command.type === "insertText")
+          .map((command) => ({
+            pluginId: plugin.id,
+            pluginName: plugin.name,
+            command,
+          })),
+      ),
+    [plugins],
+  );
+
+  const runWorkspaceSearch = useCallback(async () => {
+    const query = workspaceSearchQuery.trim();
+    if (!query) {
+      setWorkspaceSearchResults([]);
+      return;
+    }
+
+    setWorkspaceSearchBusy(true);
+    try {
+      const files = await listWorkspaceFiles();
+      const textFiles = files.filter((item) => !item.isDirectory && isTextFilePath(item.path));
+      const results: WorkspaceSearchResult[] = [];
+
+      for (const entry of textFiles) {
+        const content = await readFileAsTextSafe(entry.path);
+        if (!content) {
+          continue;
+        }
+        const lines = content.split("\n");
+        for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+          const lineText = lines[lineIndex];
+          const col = lineText.toLowerCase().indexOf(query.toLowerCase());
+          if (col < 0) {
+            continue;
+          }
+          results.push({
+            path: entry.path,
+            line: lineIndex + 1,
+            col: col + 1,
+            snippet: lineText.trim().slice(0, 180),
+          });
+          if (results.length >= MAX_SEARCH_RESULTS) {
+            break;
+          }
+        }
+        if (results.length >= MAX_SEARCH_RESULTS) {
+          break;
+        }
+      }
+
+      setWorkspaceSearchResults(results);
+      await addCommandHistory(`Workspace Search: ${query}`);
+    } finally {
+      setWorkspaceSearchBusy(false);
+    }
+  }, [addCommandHistory, listWorkspaceFiles, readFileAsTextSafe, workspaceSearchQuery]);
+
+  const openSearchResult = useCallback(
+    async (result: WorkspaceSearchResult) => {
+      await openFile(result.path);
+      setScreen("editor");
+      setWorkspaceSearchVisible(false);
+      setTimeout(() => {
+        sendToEditor({
+          type: "setCursor",
+          payload: { line: result.line, col: result.col },
+        });
+        sendToEditor({
+          type: "search",
+          payload: {
+            query: workspaceSearchQuery,
+            replace: "",
+            caseSensitive: false,
+            regex: false,
+            wholeWord: false,
+          },
+        });
+      }, 200);
+    },
+    [openFile, sendToEditor, workspaceSearchQuery],
+  );
+
+  const replaceAcrossSearchResults = useCallback(async () => {
+    const searchFor = workspaceSearchQuery;
+    if (!searchFor) {
+      return;
+    }
+    if (readOnlyMode) {
+      Alert.alert("Read Only", "Disable read-only mode to replace.");
+      return;
+    }
+
+    const targetPaths = Array.from(new Set(workspaceSearchResults.map((item) => item.path)));
+    for (const path of targetPaths) {
+      if (isProtectedPath(path)) {
+        continue;
+      }
+      const content = await readFileAsTextSafe(path);
+      if (content === null) {
+        continue;
+      }
+      if (!content.toLowerCase().includes(searchFor.toLowerCase())) {
+        continue;
+      }
+      await backupFileIfNeeded(path, content);
+      const escaped = searchFor.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const replaced = content.replace(new RegExp(escaped, "gi"), workspaceReplaceValue);
+      await FileSystem.writeAsStringAsync(path, replaced, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+
+      setTabs((prev) =>
+        prev.map((tab) =>
+          tab.path === path
+            ? {
+                ...tab,
+                content: replaced,
+                savedContent: replaced,
+              }
+            : tab,
+        ),
+      );
+    }
+
+    if (activeTab) {
+      const refreshed = tabs.find((tab) => tab.id === activeTab.id);
+      if (refreshed) {
+        syncActiveTabToEditor(refreshed);
+      }
+    }
+
+    await refreshCurrentDirectory();
+    await runWorkspaceSearch();
+    await addCommandHistory(`Replace In Search Results: ${searchFor}`);
+  }, [
+    activeTab,
+    addCommandHistory,
+    backupFileIfNeeded,
+    isProtectedPath,
+    readFileAsTextSafe,
+    readOnlyMode,
+    refreshCurrentDirectory,
+    runWorkspaceSearch,
+    syncActiveTabToEditor,
+    tabs,
+    workspaceReplaceValue,
+    workspaceSearchQuery,
+    workspaceSearchResults,
+  ]);
+
+  const initializeTracker = useCallback(async () => {
+    const files = (await listWorkspaceFiles()).filter(
+      (item) => !item.isDirectory && isTextFilePath(item.path),
+    );
+    const trackedPaths: Record<string, string> = {};
+    for (const entry of files) {
+      const content = await readFileAsTextSafe(entry.path);
+      if (content === null) {
+        continue;
+      }
+      trackedPaths[entry.path] = quickHash(content);
+    }
+
+    const next: TrackerState = {
+      initialized: true,
+      trackedPaths,
+      stagedPaths: [],
+      commits: trackerState.commits,
+    };
+    await persistTrackerState(next);
+    await addCommandHistory("Tracker Init");
+  }, [
+    addCommandHistory,
+    listWorkspaceFiles,
+    persistTrackerState,
+    readFileAsTextSafe,
+    trackerState.commits,
+  ]);
+
+  const trackerStatusMap = useMemo(() => {
+    const map: Record<string, "A" | "M"> = {};
+    if (!trackerState.initialized) {
+      return map;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory) {
+        continue;
+      }
+      if (!(entry.path in trackerState.trackedPaths)) {
+        map[entry.path] = "A";
+      }
+    }
+    for (const tab of tabs) {
+      const trackedHash = trackerState.trackedPaths[tab.path];
+      if (!trackedHash) {
+        map[tab.path] = "A";
+      } else if (quickHash(tab.content) !== trackedHash) {
+        map[tab.path] = "M";
+      }
+    }
+    return map;
+  }, [entries, tabs, trackerState]);
+
+  const trackerChangedPaths = useMemo(
+    () => Object.keys(trackerStatusMap).sort((left, right) => left.localeCompare(right)),
+    [trackerStatusMap],
+  );
+
+  const toggleStagePath = useCallback(
+    async (path: string) => {
+      const staged = trackerState.stagedPaths.includes(path);
+      const next = {
+        ...trackerState,
+        stagedPaths: staged
+          ? trackerState.stagedPaths.filter((item) => item !== path)
+          : [...trackerState.stagedPaths, path],
+      };
+      await persistTrackerState(next);
+    },
+    [persistTrackerState, trackerState],
+  );
+
+  const stageAllChanges = useCallback(async () => {
+    const changed = Object.keys(trackerStatusMap);
+    const next = {
+      ...trackerState,
+      stagedPaths: Array.from(new Set([...trackerState.stagedPaths, ...changed])),
+    };
+    await persistTrackerState(next);
+  }, [persistTrackerState, trackerState, trackerStatusMap]);
+
+  const commitTracker = useCallback(async () => {
+    if (!trackerState.initialized) {
+      Alert.alert("Tracker", "Initialize tracker first.");
+      return;
+    }
+    const message = trackerCommitMessage.trim();
+    if (!message) {
+      Alert.alert("Commit Message", "Enter a commit message.");
+      return;
+    }
+    if (!trackerState.stagedPaths.length) {
+      Alert.alert("No Staged Files", "Stage changes before committing.");
+      return;
+    }
+
+    const nextTracked = { ...trackerState.trackedPaths };
+    for (const path of trackerState.stagedPaths) {
+      const inTab = tabs.find((tab) => tab.path === path);
+      if (inTab) {
+        nextTracked[path] = quickHash(inTab.content);
+        continue;
+      }
+      const content = await readFileAsTextSafe(path);
+      if (content !== null) {
+        nextTracked[path] = quickHash(content);
+      }
+    }
+
+    const commit: TrackerCommit = {
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      message,
+      timestamp: Date.now(),
+      files: trackerState.stagedPaths,
+    };
+    const next: TrackerState = {
+      initialized: true,
+      trackedPaths: nextTracked,
+      stagedPaths: [],
+      commits: [commit, ...trackerState.commits].slice(0, 40),
+    };
+    await persistTrackerState(next);
+    setTrackerCommitMessage("");
+    await addCommandHistory(`Commit: ${message}`);
+  }, [
+    addCommandHistory,
+    persistTrackerState,
+    readFileAsTextSafe,
+    tabs,
+    trackerCommitMessage,
+    trackerState,
+  ]);
+
+  const resolveTerminalPath = useCallback(
+    (target?: string) => {
+      const raw = (target ?? "").trim();
+      const resolved = raw
+        ? (raw.startsWith("/") ? raw : joinFsPath(currentDirectory, raw))
+        : currentDirectory;
+      return pathIsWithin(resolved, WORKSPACE_ROOT) ? resolved : null;
+    },
+    [currentDirectory],
+  );
+
+  const terminalLs = useCallback(
+    async (target?: string) => {
+      const resolved = resolveTerminalPath(target);
+      if (!resolved) {
+        throw new Error("Path is outside workspace.");
+      }
+      const names = await FileSystem.readDirectoryAsync(resolved);
+      return names.sort().join("  ");
+    },
+    [resolveTerminalPath],
+  );
+
+  const runTerminalCommand = useCallback(async () => {
+    const raw = terminalInput.trim();
+    if (!raw) {
+      return;
+    }
+
+    appendTerminalLog("input", `$ ${raw}`);
+    setTerminalInput("");
+
+    const [cmd, ...rest] = raw.split(" ");
+    const arg = rest.join(" ").trim();
+
+    try {
+      switch (cmd) {
+        case "help":
+          appendTerminalLog(
+            "output",
+            "help, pwd, ls [path], cat <file>, touch <file>, mkdir <dir>, rm <path>, mv <from> <to>, echo <text>",
+          );
+          break;
+        case "pwd":
+          appendTerminalLog("output", formatRelativePath(currentDirectory));
+          break;
+        case "ls":
+          appendTerminalLog("output", await terminalLs(arg || undefined));
+          break;
+        case "cat": {
+          const target = resolveTerminalPath(arg);
+          if (!target) {
+            appendTerminalLog("error", "Path is outside workspace.");
+            break;
+          }
+          const content = await readFileAsTextSafe(target);
+          appendTerminalLog("output", content ?? "[binary or unreadable]");
+          break;
+        }
+        case "touch": {
+          if (!arg) {
+            appendTerminalLog("error", "touch requires a filename.");
+            break;
+          }
+          const target = resolveTerminalPath(arg);
+          if (!target) {
+            appendTerminalLog("error", "Path is outside workspace.");
+            break;
+          }
+          if (readOnlyMode || isProtectedPath(target)) {
+            appendTerminalLog("error", "Path is read-only or protected.");
+            break;
+          }
+          await FileSystem.writeAsStringAsync(target, "", {
+            encoding: FileSystem.EncodingType.UTF8,
+          });
+          appendTerminalLog("output", `created ${target}`);
+          await refreshCurrentDirectory();
+          break;
+        }
+        case "mkdir": {
+          if (!arg) {
+            appendTerminalLog("error", "mkdir requires a folder name.");
+            break;
+          }
+          const target = resolveTerminalPath(arg);
+          if (!target) {
+            appendTerminalLog("error", "Path is outside workspace.");
+            break;
+          }
+          if (readOnlyMode || isProtectedPath(target)) {
+            appendTerminalLog("error", "Path is read-only or protected.");
+            break;
+          }
+          await FileSystem.makeDirectoryAsync(target, { intermediates: true });
+          appendTerminalLog("output", `created ${target}`);
+          await refreshCurrentDirectory();
+          break;
+        }
+        case "rm": {
+          if (!arg) {
+            appendTerminalLog("error", "rm requires a path.");
+            break;
+          }
+          const target = resolveTerminalPath(arg);
+          if (!target) {
+            appendTerminalLog("error", "Path is outside workspace.");
+            break;
+          }
+          if (readOnlyMode || isProtectedPath(target)) {
+            appendTerminalLog("error", "Path is read-only or protected.");
+            break;
+          }
+          await FileSystem.deleteAsync(target, { idempotent: true });
+          appendTerminalLog("output", `deleted ${target}`);
+          await refreshCurrentDirectory();
+          break;
+        }
+        case "mv": {
+          const from = rest[0];
+          const to = rest[1];
+          if (!from || !to) {
+            appendTerminalLog("error", "mv requires source and destination.");
+            break;
+          }
+          const source = resolveTerminalPath(from);
+          const destination = resolveTerminalPath(to);
+          if (!source || !destination) {
+            appendTerminalLog("error", "Path is outside workspace.");
+            break;
+          }
+          if (readOnlyMode || isProtectedPath(source) || isProtectedPath(destination)) {
+            appendTerminalLog("error", "Path is read-only or protected.");
+            break;
+          }
+          await FileSystem.moveAsync({ from: source, to: destination });
+          appendTerminalLog("output", `${source} -> ${destination}`);
+          await refreshCurrentDirectory();
+          break;
+        }
+        case "echo":
+          appendTerminalLog("output", arg);
+          break;
+        default:
+          appendTerminalLog("error", `Unknown command: ${cmd}`);
+          break;
+      }
+    } catch (error) {
+      appendTerminalLog("error", `Command failed: ${String(error)}`);
+    }
+  }, [
+    appendTerminalLog,
+    currentDirectory,
+    isProtectedPath,
+    readFileAsTextSafe,
+    readOnlyMode,
+    refreshCurrentDirectory,
+    resolveTerminalPath,
+    terminalInput,
+    terminalLs,
+  ]);
+
+  const togglePathSelection = useCallback((path: string) => {
+    setSelectedPaths((prev) =>
+      prev.includes(path) ? prev.filter((item) => item !== path) : [...prev, path],
+    );
+  }, []);
+
+  const bulkDeleteSelected = useCallback(async () => {
+    if (!selectedPaths.length) {
+      return;
+    }
+    if (readOnlyMode) {
+      Alert.alert("Read Only", "Disable read-only mode to delete.");
+      return;
+    }
+
+    for (const path of selectedPaths) {
+      if (isProtectedPath(path)) {
+        continue;
+      }
+      await FileSystem.deleteAsync(path, { idempotent: true });
+    }
+    setSelectedPaths([]);
+    setSelectionMode(false);
+    await refreshCurrentDirectory();
+  }, [isProtectedPath, readOnlyMode, refreshCurrentDirectory, selectedPaths]);
+
+  const bulkMoveSelectedToCurrent = useCallback(async () => {
+    if (!selectedPaths.length) {
+      return;
+    }
+    if (readOnlyMode) {
+      Alert.alert("Read Only", "Disable read-only mode to move.");
+      return;
+    }
+
+    for (const path of selectedPaths) {
+      if (pathIsWithin(currentDirectory, path) || isProtectedPath(path)) {
+        continue;
+      }
+      const destination = joinFsPath(currentDirectory, basename(path));
+      const exists = await FileSystem.getInfoAsync(destination);
+      if (exists.exists) {
+        continue;
+      }
+      await FileSystem.moveAsync({ from: path, to: destination });
+    }
+    setSelectedPaths([]);
+    setSelectionMode(false);
+    await refreshCurrentDirectory();
+  }, [currentDirectory, isProtectedPath, readOnlyMode, refreshCurrentDirectory, selectedPaths]);
+
+  const togglePinFolder = useCallback(
+    async (path: string) => {
+      const exists = pinnedFolders.includes(path);
+      const next = exists
+        ? pinnedFolders.filter((item) => item !== path)
+        : [path, ...pinnedFolders];
+      await persistPinnedFolders(next);
+    },
+    [persistPinnedFolders, pinnedFolders],
+  );
+
+  const toggleProtectPath = useCallback(
+    async (path: string) => {
+      const exists = protectedPaths.includes(path);
+      const next = exists
+        ? protectedPaths.filter((item) => item !== path)
+        : [path, ...protectedPaths];
+      await persistProtectedPaths(next);
+    },
+    [persistProtectedPaths, protectedPaths],
+  );
+
+  const executePluginCommand = useCallback(
+    async (command: PluginCommand) => {
+      switch (command.type) {
+        case "showMessage":
+          Alert.alert("Plugin", command.payload);
+          break;
+        case "openFile":
+          {
+            const target = command.payload.startsWith("/")
+              ? command.payload
+              : joinFsPath(WORKSPACE_ROOT, command.payload);
+            if (!pathIsWithin(target, WORKSPACE_ROOT)) {
+              Alert.alert("Plugin", "Plugin path is outside workspace.");
+              break;
+            }
+            await openFile(target);
+          }
+          break;
+        case "insertText":
+          if (activeTab) {
+            await insertSnippetIntoActiveTab(command.payload);
+          }
+          break;
+        default:
+          break;
+      }
+      await addCommandHistory(`Plugin: ${command.label}`);
+    },
+    [activeTab, addCommandHistory, insertSnippetIntoActiveTab, openFile],
+  );
+
+  const outlineSymbols = useMemo(() => {
+    if (!activeTab) {
+      return [] as Array<{ label: string; line: number }>;
+    }
+    const lines = activeTab.content.split("\n");
+    const symbols: Array<{ label: string; line: number }> = [];
+    for (let index = 0; index < lines.length; index += 1) {
+      const text = lines[index].trim();
+      if (
+        text.startsWith("function ") ||
+        text.startsWith("class ") ||
+        text.startsWith("def ") ||
+        text.startsWith("# ")
+      ) {
+        symbols.push({
+          label: text.slice(0, 80),
+          line: index + 1,
+        });
+      }
+    }
+    return symbols.slice(0, 120);
+  }, [activeTab]);
 
   const createFolder = useCallback(async () => {
     const trimmed = newFolderName.trim();
@@ -969,6 +2159,10 @@ function IPCoderApp() {
     }
 
     const destination = joinFsPath(currentDirectory, trimmed);
+    if (readOnlyMode || isProtectedPath(destination)) {
+      Alert.alert("Read Only", "Target path is protected or read-only.");
+      return;
+    }
 
     try {
       const folderInfo = await FileSystem.getInfoAsync(destination);
@@ -982,11 +2176,19 @@ function IPCoderApp() {
       setNewFolderModalVisible(false);
       setNewFolderName("new-folder");
       await refreshCurrentDirectory();
+      await addCommandHistory(`Create Folder ${trimmed}`);
     } catch (error) {
       console.error(error);
       Alert.alert("Create Error", "Unable to create the folder.");
     }
-  }, [currentDirectory, newFolderName, refreshCurrentDirectory]);
+  }, [
+    addCommandHistory,
+    currentDirectory,
+    isProtectedPath,
+    newFolderName,
+    readOnlyMode,
+    refreshCurrentDirectory,
+  ]);
 
   const resolveDuplicatePath = useCallback(async (entry: FileEntry) => {
     const sourceName = entry.name;
@@ -1011,7 +2213,15 @@ function IPCoderApp() {
   const duplicateEntry = useCallback(
     async (entry: FileEntry) => {
       try {
+        if (readOnlyMode || isProtectedPath(entry.path)) {
+          Alert.alert("Read Only", "Selected path is protected or read-only.");
+          return;
+        }
         const destination = await resolveDuplicatePath(entry);
+        if (isProtectedPath(destination)) {
+          Alert.alert("Protected", "Destination path is protected.");
+          return;
+        }
         await FileSystem.copyAsync({
           from: entry.path,
           to: destination,
@@ -1020,12 +2230,13 @@ function IPCoderApp() {
         setEntryActionModalVisible(false);
         setSelectedEntry(null);
         await refreshCurrentDirectory();
+        await addCommandHistory(`Duplicate ${entry.name}`);
       } catch (error) {
         console.error(error);
         Alert.alert("Duplicate Error", "Unable to duplicate the selected item.");
       }
     },
-    [refreshCurrentDirectory, resolveDuplicatePath],
+    [addCommandHistory, isProtectedPath, readOnlyMode, refreshCurrentDirectory, resolveDuplicatePath],
   );
 
   const startRenameEntry = useCallback((entry: FileEntry) => {
@@ -1051,6 +2262,10 @@ function IPCoderApp() {
     }
 
     const destination = joinFsPath(parentPath(selectedEntry.path, WORKSPACE_ROOT), trimmed);
+    if (readOnlyMode || isProtectedPath(selectedEntry.path) || isProtectedPath(destination)) {
+      Alert.alert("Read Only", "Selected path is protected or read-only.");
+      return;
+    }
     if (stripTrailingSlash(destination) === stripTrailingSlash(selectedEntry.path)) {
       setRenameModalVisible(false);
       setRenameValue("");
@@ -1094,21 +2309,35 @@ function IPCoderApp() {
       setRenameValue("");
       setSelectedEntry(null);
       await refreshCurrentDirectory();
+      await addCommandHistory(`Rename ${selectedEntry.name} -> ${trimmed}`);
     } catch (error) {
       console.error(error);
       Alert.alert("Rename Error", "Unable to rename the selected item.");
     }
   }, [
+    addCommandHistory,
     currentDirectory,
     refreshCurrentDirectory,
     remapRecentEntriesByPrefix,
     renameValue,
+    isProtectedPath,
+    readOnlyMode,
     selectedEntry,
   ]);
 
   const deleteEntryNow = useCallback(
     async (entry: FileEntry) => {
       try {
+        if (readOnlyMode || isProtectedPath(entry.path)) {
+          Alert.alert("Read Only", "Selected path is protected or read-only.");
+          return;
+        }
+        if (!entry.isDirectory) {
+          const currentContent = await readFileAsTextSafe(entry.path);
+          if (currentContent !== null) {
+            await backupFileIfNeeded(entry.path, currentContent);
+          }
+        }
         await FileSystem.deleteAsync(entry.path, { idempotent: true });
 
         const remainingTabs = tabs.filter((tab) => !pathIsWithin(tab.path, entry.path));
@@ -1131,12 +2360,24 @@ function IPCoderApp() {
         }
 
         await refreshCurrentDirectory();
+        await addCommandHistory(`Delete ${entry.name}`);
       } catch (error) {
         console.error(error);
         Alert.alert("Delete Error", "Unable to delete the selected item.");
       }
     },
-    [activeTabId, currentDirectory, refreshCurrentDirectory, removeRecentEntriesByPrefix, tabs],
+    [
+      activeTabId,
+      addCommandHistory,
+      backupFileIfNeeded,
+      currentDirectory,
+      isProtectedPath,
+      readFileAsTextSafe,
+      readOnlyMode,
+      refreshCurrentDirectory,
+      removeRecentEntriesByPrefix,
+      tabs,
+    ],
   );
 
   const requestDeleteEntry = useCallback(
@@ -1298,12 +2539,23 @@ function IPCoderApp() {
     <View style={styles.screen}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>[IPCoder]</Text>
-        <View style={styles.headerActions}>
+        <ScrollView
+          horizontal
+          style={styles.headerActionsScroll}
+          contentContainerStyle={styles.headerActions}
+          showsHorizontalScrollIndicator={false}
+        >
           <Pressable style={styles.headerButton} onPress={() => setNewFileModalVisible(true)}>
             <Text style={styles.headerButtonText}>[+] New File</Text>
           </Pressable>
           <Pressable style={styles.headerButton} onPress={() => setNewFolderModalVisible(true)}>
             <Text style={styles.headerButtonText}>[+] New Folder</Text>
+          </Pressable>
+          <Pressable style={styles.headerButton} onPress={() => setCommandPaletteVisible(true)}>
+            <Text style={styles.headerButtonText}>[Cmd]</Text>
+          </Pressable>
+          <Pressable style={styles.headerButton} onPress={() => setWorkspaceSearchVisible(true)}>
+            <Text style={styles.headerButtonText}>[Search+]</Text>
           </Pressable>
           <Pressable
             style={styles.headerButton}
@@ -1315,10 +2567,16 @@ function IPCoderApp() {
           >
             <Text style={styles.headerButtonText}>[Editor]</Text>
           </Pressable>
+          <Pressable style={styles.headerButton} onPress={() => setTrackerVisible(true)}>
+            <Text style={styles.headerButtonText}>[Tracker]</Text>
+          </Pressable>
+          <Pressable style={styles.headerButton} onPress={() => setTerminalVisible(true)}>
+            <Text style={styles.headerButtonText}>[Terminal]</Text>
+          </Pressable>
           <Pressable style={styles.headerButton} onPress={() => setScreen("settings")}> 
             <Text style={styles.headerButtonText}>[Settings]</Text>
           </Pressable>
-        </View>
+        </ScrollView>
       </View>
 
       <ScrollView style={styles.scrollArea}>
@@ -1352,6 +2610,44 @@ function IPCoderApp() {
         {renderBreadcrumb()}
         <Text style={styles.listHintText}>Long press files/folders for actions.</Text>
 
+        {pinnedFolders.length ? (
+          <>
+            <Text style={styles.sectionLabel}>Pinned Folders</Text>
+            {pinnedFolders.map((path) => (
+              <Pressable
+                key={path}
+                style={styles.fileRow}
+                onPress={() => setCurrentDirectory(path)}
+                onLongPress={() => {
+                  void togglePinFolder(path);
+                }}
+              >
+                <Text style={styles.fileRowDirectory}>[PIN] {basename(path)}</Text>
+                <Text style={styles.fileRowPath}>{formatRelativePath(path)}</Text>
+              </Pressable>
+            ))}
+          </>
+        ) : null}
+
+        {selectionMode ? (
+          <View style={styles.bulkBar}>
+            <Text style={styles.bulkBarText}>Selected: {selectedPaths.length}</Text>
+            <Pressable style={styles.bulkButton} onPress={() => void bulkMoveSelectedToCurrent()}>
+              <Text style={styles.bulkButtonText}>Move Here</Text>
+            </Pressable>
+            <Pressable style={styles.bulkButtonDanger} onPress={() => void bulkDeleteSelected()}>
+              <Text style={styles.bulkButtonDangerText}>Delete</Text>
+            </Pressable>
+            <Pressable style={styles.bulkButton} onPress={() => setSelectionMode(false)}>
+              <Text style={styles.bulkButtonText}>Done</Text>
+            </Pressable>
+          </View>
+        ) : (
+          <Pressable style={styles.selectionToggle} onPress={() => setSelectionMode(true)}>
+            <Text style={styles.selectionToggleText}>[Select Multiple]</Text>
+          </Pressable>
+        )}
+
         {stripTrailingSlash(currentDirectory) !== stripTrailingSlash(WORKSPACE_ROOT) ? (
           <Pressable
             style={styles.fileRow}
@@ -1367,6 +2663,10 @@ function IPCoderApp() {
             key={entry.path}
             style={styles.fileRow}
             onPress={() => {
+              if (selectionMode) {
+                togglePathSelection(entry.path);
+                return;
+              }
               if (entry.isDirectory) {
                 setCurrentDirectory(entry.path);
               } else {
@@ -1382,8 +2682,11 @@ function IPCoderApp() {
                 !entry.isDirectory && unsavedPathSet.has(entry.path) ? styles.fileRowDraft : null,
               ]}
             >
+              {selectionMode ? (selectedPaths.includes(entry.path) ? "[X] " : "[ ] ") : ""}
               {entry.isDirectory ? `[DIR] ${entry.name}` : entry.name}
               {!entry.isDirectory && unsavedPathSet.has(entry.path) ? " [DRAFT]" : ""}
+              {trackerStatusMap[entry.path] ? ` [${trackerStatusMap[entry.path]}]` : ""}
+              {trackerState.stagedPaths.includes(entry.path) ? " [STAGED]" : ""}
             </Text>
             <Text style={styles.fileRowPath}>{formatRelativePath(entry.path)}</Text>
           </Pressable>
@@ -1487,6 +2790,17 @@ function IPCoderApp() {
           {renderToolbarButton("Comment", () =>
             sendToEditor({ type: "command", payload: { name: "comment" as ToolbarCommand } }),
           )}
+          {renderToolbarButton("Format", () => {
+            void formatActiveDocument();
+          })}
+          {renderToolbarButton("Snippet", () => setSnippetVisible(true))}
+          {renderToolbarButton("Cmd", () => setCommandPaletteVisible(true))}
+          {renderToolbarButton(`Outline ${outlineVisible ? "ON" : "OFF"}`, () =>
+            setOutlineVisible((prev) => !prev),
+          )}
+          {renderToolbarButton(`MiniMap ${showMiniMap ? "ON" : "OFF"}`, () =>
+            setShowMiniMap((prev) => !prev),
+          )}
           {renderToolbarButton(`Theme ${settings.theme}`, () => {
             void cycleTheme();
           })}
@@ -1499,17 +2813,28 @@ function IPCoderApp() {
     <View style={styles.screen}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>[IPCoder]</Text>
-        <View style={styles.headerActions}>
+        <ScrollView
+          horizontal
+          style={styles.headerActionsScroll}
+          contentContainerStyle={styles.headerActions}
+          showsHorizontalScrollIndicator={false}
+        >
           <Pressable style={styles.headerButton} onPress={() => setScreen("home")}> 
             <Text style={styles.headerButtonText}>[Files]</Text>
+          </Pressable>
+          <Pressable style={styles.headerButton} onPress={() => setCommandPaletteVisible(true)}>
+            <Text style={styles.headerButtonText}>[Cmd]</Text>
           </Pressable>
           <Pressable style={styles.headerButton} onPress={() => void saveActiveTab()}>
             <Text style={styles.headerButtonText}>[Save]</Text>
           </Pressable>
+          <Pressable style={styles.headerButton} onPress={() => setSnippetVisible(true)}>
+            <Text style={styles.headerButtonText}>[Snippet]</Text>
+          </Pressable>
           <Pressable style={styles.headerButton} onPress={() => setScreen("settings")}> 
             <Text style={styles.headerButtonText}>[Settings]</Text>
           </Pressable>
-        </View>
+        </ScrollView>
       </View>
 
       <ScrollView horizontal style={styles.tabStrip} contentContainerStyle={styles.tabStripContent}>
@@ -1520,26 +2845,76 @@ function IPCoderApp() {
         style={styles.editorArea}
         behavior={Platform.OS === "ios" ? "padding" : undefined}
       >
-        {editorHtml ? (
-          <WebView
-            ref={webviewRef}
-            originWhitelist={["*"]}
-            source={{ html: editorHtml }}
-            onMessage={onWebViewMessage}
-            javaScriptEnabled
-            allowFileAccess
-            allowUniversalAccessFromFileURLs
-            setSupportMultipleWindows={false}
-            style={styles.webview}
-            onError={() => {
-              Alert.alert("WebView Error", "Failed to render offline CodeMirror surface.");
-            }}
-          />
-        ) : (
-          <View style={styles.loadingWrap}>
-            <Text style={styles.loadingText}>Loading local editor bundle...</Text>
+        <View style={styles.editorSurfaceRow}>
+          <View style={styles.editorSurfaceMain}>
+            {editorHtml ? (
+              <WebView
+                ref={webviewRef}
+                originWhitelist={["*"]}
+                source={{ html: editorHtml }}
+                onMessage={onWebViewMessage}
+                javaScriptEnabled
+                allowFileAccess
+                allowUniversalAccessFromFileURLs
+                setSupportMultipleWindows={false}
+                style={styles.webview}
+                onError={() => {
+                  Alert.alert("WebView Error", "Failed to render offline CodeMirror surface.");
+                }}
+              />
+            ) : (
+              <View style={styles.loadingWrap}>
+                <Text style={styles.loadingText}>Loading local editor bundle...</Text>
+              </View>
+            )}
           </View>
-        )}
+
+          {showMiniMap && activeTab ? (
+            <View style={styles.miniMapWrap}>
+              <Text style={styles.miniMapTitle}>MAP</Text>
+              <ScrollView style={styles.miniMapScroll}>
+                {activeTab.content
+                  .split("\n")
+                  .slice(0, 300)
+                  .map((line, index) => (
+                    <Text key={`${index}-${line.length}`} style={styles.miniMapLine}>
+                      {line.slice(0, 40)}
+                    </Text>
+                  ))}
+              </ScrollView>
+            </View>
+          ) : null}
+        </View>
+
+        {outlineVisible && activeTab ? (
+          <View style={styles.outlinePanel}>
+            <View style={styles.outlineHeader}>
+              <Text style={styles.outlineTitle}>OUTLINE</Text>
+              <Pressable onPress={() => setOutlineVisible(false)}>
+                <Text style={styles.outlineCloseText}>[X]</Text>
+              </Pressable>
+            </View>
+            <ScrollView style={styles.outlineScroll}>
+              {outlineSymbols.length ? (
+                outlineSymbols.map((symbol) => (
+                  <Pressable
+                    key={`${symbol.line}-${symbol.label}`}
+                    style={styles.outlineRow}
+                    onPress={() => {
+                      void goToLine(String(symbol.line));
+                    }}
+                  >
+                    <Text style={styles.outlineRowText}>
+                      {symbol.line}: {symbol.label}
+                    </Text>
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.outlineEmpty}>No symbols detected.</Text>
+              )}
+            </ScrollView>
+          </View>
+        ) : null}
 
         {!activeTab ? (
           <View style={styles.noTabWrap}>
@@ -1570,11 +2945,16 @@ function IPCoderApp() {
     <View style={styles.screen}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>[Settings]</Text>
-        <View style={styles.headerActions}>
+        <ScrollView
+          horizontal
+          style={styles.headerActionsScroll}
+          contentContainerStyle={styles.headerActions}
+          showsHorizontalScrollIndicator={false}
+        >
           <Pressable style={styles.headerButton} onPress={() => setScreen("home")}> 
             <Text style={styles.headerButtonText}>[Back]</Text>
           </Pressable>
-        </View>
+        </ScrollView>
       </View>
 
       <ScrollView style={styles.scrollArea}>
@@ -1606,6 +2986,71 @@ function IPCoderApp() {
           <Text style={styles.settingLabel}>
             [{settings.showHiddenFiles ? "X" : " "}] Show Hidden Files
           </Text>
+        </Pressable>
+        <Pressable
+          style={styles.settingRow}
+          onPress={() => setReadOnlyMode((prev) => !prev)}
+        >
+          <Text style={styles.settingLabel}>[{readOnlyMode ? "X" : " "}] Read Only Mode</Text>
+        </Pressable>
+        <Pressable
+          style={styles.settingRow}
+          onPress={() => setShowMiniMap((prev) => !prev)}
+        >
+          <Text style={styles.settingLabel}>[{showMiniMap ? "X" : " "}] Show MiniMap</Text>
+        </Pressable>
+        <Pressable
+          style={styles.settingRow}
+          onPress={() => setOutlineVisible((prev) => !prev)}
+        >
+          <Text style={styles.settingLabel}>[{outlineVisible ? "X" : " "}] Outline Panel</Text>
+        </Pressable>
+
+        <Text style={styles.sectionLabel}>Protected Paths</Text>
+        {protectedPaths.length ? (
+          protectedPaths.map((path) => (
+            <Pressable
+              key={path}
+              style={styles.fileRow}
+              onPress={() => {
+                void toggleProtectPath(path);
+              }}
+            >
+              <Text style={styles.fileRowName}>[UNPROTECT] {basename(path)}</Text>
+              <Text style={styles.fileRowPath}>{formatRelativePath(path)}</Text>
+            </Pressable>
+          ))
+        ) : (
+          <Text style={styles.emptyText}>No protected paths.</Text>
+        )}
+
+        <Text style={styles.sectionLabel}>Plugins</Text>
+        {plugins.length ? (
+          plugins.map((plugin) => (
+            <View key={plugin.id} style={styles.pluginCard}>
+              <Text style={styles.pluginTitle}>{plugin.name}</Text>
+              {plugin.commands.length ? (
+                plugin.commands.slice(0, 8).map((command) => (
+                  <Pressable
+                    key={`${plugin.id}-${command.id}`}
+                    style={styles.pluginCommandButton}
+                    onPress={() => {
+                      void executePluginCommand(command);
+                    }}
+                  >
+                    <Text style={styles.pluginCommandText}>{command.label}</Text>
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No commands.</Text>
+              )}
+            </View>
+          ))
+        ) : (
+          <Text style={styles.emptyText}>No local plugins in `workspace/.ipcoder/plugins`.</Text>
+        )}
+        <Pressable style={styles.settingRow} onPress={() => void loadLocalPlugins()}>
+          <Text style={styles.settingLabel}>[ ] Reload Plugins</Text>
         </Pressable>
 
         <Pressable
@@ -1722,6 +3167,44 @@ function IPCoderApp() {
               </Pressable>
 
               <Pressable
+                style={styles.actionMenuButton}
+                onPress={() => {
+                  if (!selectedEntry) {
+                    return;
+                  }
+                  void toggleProtectPath(selectedEntry.path);
+                  setEntryActionModalVisible(false);
+                  setSelectedEntry(null);
+                }}
+              >
+                <Text style={styles.actionMenuButtonText}>
+                  {selectedEntry && isProtectedPath(selectedEntry.path)
+                    ? "Unprotect Path"
+                    : "Protect Path"}
+                </Text>
+              </Pressable>
+
+              {selectedEntry?.isDirectory ? (
+                <Pressable
+                  style={styles.actionMenuButton}
+                  onPress={() => {
+                    if (!selectedEntry) {
+                      return;
+                    }
+                    void togglePinFolder(selectedEntry.path);
+                    setEntryActionModalVisible(false);
+                    setSelectedEntry(null);
+                  }}
+                >
+                  <Text style={styles.actionMenuButtonText}>
+                    {selectedEntry && pinnedFolders.includes(selectedEntry.path)
+                      ? "Unpin Folder"
+                      : "Pin Folder"}
+                  </Text>
+                </Pressable>
+              ) : null}
+
+              <Pressable
                 style={[styles.actionMenuButton, styles.actionMenuButtonDanger]}
                 onPress={() => {
                   if (!selectedEntry) {
@@ -1831,6 +3314,405 @@ function IPCoderApp() {
           </View>
         </View>
       </Modal>
+
+      <Modal visible={commandPaletteVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>Command Palette</Text>
+            <TextInput
+              style={styles.modalInput}
+              value={commandQuery}
+              onChangeText={setCommandQuery}
+              autoCapitalize="none"
+              autoCorrect={false}
+              placeholder="Search commands or files"
+              placeholderTextColor="#555555"
+            />
+
+            <View style={styles.inlineInputRow}>
+              <TextInput
+                style={[styles.modalInput, styles.inlineInput]}
+                value={goToLineValue}
+                onChangeText={setGoToLineValue}
+                keyboardType="number-pad"
+                placeholder="Go to line"
+                placeholderTextColor="#555555"
+              />
+              <Pressable
+                style={styles.modalButtonPrimary}
+                onPress={() => {
+                  void goToLine(goToLineValue);
+                }}
+              >
+                <Text style={styles.modalButtonPrimaryText}>Go</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setCommandPaletteVisible(false);
+                  setCommandQuery("");
+                  setGoToLineValue("");
+                }}
+              >
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+
+            <ScrollView
+              horizontal
+              style={styles.modalActionsStrip}
+              contentContainerStyle={styles.modalActionsStripContent}
+            >
+              <Pressable style={styles.modalButton} onPress={() => void saveActiveTab()}>
+                <Text style={styles.modalButtonText}>Save</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => void formatActiveDocument()}>
+                <Text style={styles.modalButtonText}>Format</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setSnippetVisible(true)}>
+                <Text style={styles.modalButtonText}>Snippets</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setWorkspaceSearchVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Search+</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setTrackerVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Tracker</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setTerminalVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Terminal</Text>
+              </Pressable>
+            </ScrollView>
+
+            <Text style={styles.modalSectionLabel}>Quick Open</Text>
+            <ScrollView style={styles.modalList}>
+              {quickOpenMatches.length ? (
+                quickOpenMatches.map((item) => (
+                  <Pressable
+                    key={item.path}
+                    style={styles.modalListRow}
+                    onPress={() => {
+                      void openFile(item.path);
+                      setCommandPaletteVisible(false);
+                      setCommandQuery("");
+                    }}
+                  >
+                    <Text style={styles.modalListRowTitle}>{item.name}</Text>
+                    <Text style={styles.modalListRowPath}>{formatRelativePath(item.path)}</Text>
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No file matches.</Text>
+              )}
+            </ScrollView>
+
+            <Text style={styles.modalSectionLabel}>Plugin Commands</Text>
+            <ScrollView style={styles.modalList}>
+              {pluginCommandMatches.length ? (
+                pluginCommandMatches.map((item) => (
+                  <Pressable
+                    key={`${item.pluginId}-${item.command.id}`}
+                    style={styles.modalListRow}
+                    onPress={() => {
+                      void executePluginCommand(item.command);
+                      setCommandPaletteVisible(false);
+                    }}
+                  >
+                    <Text style={styles.modalListRowTitle}>{item.command.label}</Text>
+                    <Text style={styles.modalListRowPath}>{item.pluginName}</Text>
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No matching plugin commands.</Text>
+              )}
+            </ScrollView>
+
+            <Text style={styles.modalSectionLabel}>Recent Commands</Text>
+            <ScrollView style={styles.modalList}>
+              {commandHistory.length ? (
+                commandHistory.slice(0, 12).map((entry) => (
+                  <Text key={entry.id} style={styles.historyRowText}>
+                    {entry.label}
+                  </Text>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No history yet.</Text>
+              )}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={workspaceSearchVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>Workspace Search</Text>
+            <TextInput
+              style={styles.modalInput}
+              value={workspaceSearchQuery}
+              onChangeText={setWorkspaceSearchQuery}
+              autoCapitalize="none"
+              autoCorrect={false}
+              placeholder="Search text"
+              placeholderTextColor="#555555"
+            />
+            <TextInput
+              style={[styles.modalInput, styles.modalInputTopGap]}
+              value={workspaceReplaceValue}
+              onChangeText={setWorkspaceReplaceValue}
+              autoCapitalize="none"
+              autoCorrect={false}
+              placeholder="Replace with"
+              placeholderTextColor="#555555"
+            />
+
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButton} onPress={() => void runWorkspaceSearch()}>
+                <Text style={styles.modalButtonText}>Find</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButtonPrimary}
+                onPress={() => void replaceAcrossSearchResults()}
+              >
+                <Text style={styles.modalButtonPrimaryText}>Replace All</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setWorkspaceSearchVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+
+            {workspaceSearchBusy ? (
+              <Text style={styles.searchBusyText}>Searching workspace...</Text>
+            ) : null}
+
+            <ScrollView style={styles.modalList}>
+              {workspaceSearchResults.length ? (
+                workspaceSearchResults.map((result, index) => (
+                  <Pressable
+                    key={`${result.path}-${result.line}-${index}`}
+                    style={styles.searchResultRow}
+                    onPress={() => {
+                      void openSearchResult(result);
+                    }}
+                  >
+                    <Text style={styles.searchResultTitle}>
+                      {basename(result.path)}:{result.line}:{result.col}
+                    </Text>
+                    <Text style={styles.searchResultPath}>{formatRelativePath(result.path)}</Text>
+                    <Text style={styles.searchResultSnippet}>{result.snippet}</Text>
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No results.</Text>
+              )}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={trackerVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>Workspace Tracker</Text>
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButton} onPress={() => void initializeTracker()}>
+                <Text style={styles.modalButtonText}>
+                  {trackerState.initialized ? "Re-Init" : "Init"}
+                </Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => void stageAllChanges()}>
+                <Text style={styles.modalButtonText}>Stage All</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setTrackerVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+
+            <Text style={styles.modalSectionLabel}>Changes</Text>
+            <ScrollView style={styles.modalList}>
+              {trackerChangedPaths.length ? (
+                trackerChangedPaths.map((path) => {
+                  const staged = trackerState.stagedPaths.includes(path);
+                  const status = trackerStatusMap[path];
+                  return (
+                    <Pressable
+                      key={path}
+                      style={styles.trackerRow}
+                      onPress={() => {
+                        void toggleStagePath(path);
+                      }}
+                    >
+                      <Text style={styles.trackerRowTitle}>
+                        [{staged ? "X" : " "}] {status} {basename(path)}
+                      </Text>
+                      <Text style={styles.trackerRowPath}>{formatRelativePath(path)}</Text>
+                    </Pressable>
+                  );
+                })
+              ) : (
+                <Text style={styles.emptyText}>No detected changes.</Text>
+              )}
+            </ScrollView>
+
+            <TextInput
+              style={styles.modalInput}
+              value={trackerCommitMessage}
+              onChangeText={setTrackerCommitMessage}
+              autoCapitalize="none"
+              autoCorrect={false}
+              placeholder="Commit message"
+              placeholderTextColor="#555555"
+            />
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButtonPrimary} onPress={() => void commitTracker()}>
+                <Text style={styles.modalButtonPrimaryText}>Commit</Text>
+              </Pressable>
+            </View>
+
+            <Text style={styles.modalSectionLabel}>Recent Commits</Text>
+            <ScrollView style={styles.modalList}>
+              {trackerState.commits.length ? (
+                trackerState.commits.slice(0, 12).map((commit) => (
+                  <View key={commit.id} style={styles.commitRow}>
+                    <Text style={styles.commitRowTitle}>{commit.message}</Text>
+                    <Text style={styles.commitRowMeta}>
+                      {new Date(commit.timestamp).toLocaleString()} | {commit.files.length} files
+                    </Text>
+                  </View>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No commits yet.</Text>
+              )}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={terminalVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>Terminal</Text>
+
+            <ScrollView style={styles.terminalLogWrap}>
+              {terminalLogs.length ? (
+                terminalLogs.map((entry) => (
+                  <Text
+                    key={entry.id}
+                    style={[
+                      styles.terminalLine,
+                      entry.type === "error"
+                        ? styles.terminalLineError
+                        : entry.type === "input"
+                          ? styles.terminalLineInput
+                          : null,
+                    ]}
+                  >
+                    {entry.text}
+                  </Text>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No terminal activity yet.</Text>
+              )}
+            </ScrollView>
+
+            <View style={styles.inlineInputRow}>
+              <TextInput
+                style={[styles.modalInput, styles.inlineInput]}
+                value={terminalInput}
+                onChangeText={setTerminalInput}
+                autoCapitalize="none"
+                autoCorrect={false}
+                onSubmitEditing={() => {
+                  void runTerminalCommand();
+                }}
+                placeholder="type command (help)"
+                placeholderTextColor="#555555"
+              />
+              <Pressable style={styles.modalButtonPrimary} onPress={() => void runTerminalCommand()}>
+                <Text style={styles.modalButtonPrimaryText}>Run</Text>
+              </Pressable>
+            </View>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setTerminalLogs([]);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Clear</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setTerminalVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={snippetVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Snippets</Text>
+            <ScrollView style={styles.modalList}>
+              {BUILTIN_SNIPPETS.map((snippet) => (
+                <Pressable
+                  key={snippet.id}
+                  style={styles.modalListRow}
+                  onPress={() => {
+                    void insertSnippetIntoActiveTab(snippet.body);
+                  }}
+                >
+                  <Text style={styles.modalListRowTitle}>{snippet.label}</Text>
+                </Pressable>
+              ))}
+            </ScrollView>
+
+            {pluginInsertCommands.length ? (
+              <>
+                <Text style={styles.modalSectionLabel}>Plugin Snippets</Text>
+                <ScrollView style={styles.modalList}>
+                  {pluginInsertCommands.map((item) => (
+                    <Pressable
+                      key={`${item.pluginId}-${item.command.id}`}
+                      style={styles.modalListRow}
+                      onPress={() => {
+                        void executePluginCommand(item.command);
+                        setSnippetVisible(false);
+                      }}
+                    >
+                      <Text style={styles.modalListRowTitle}>{item.command.label}</Text>
+                      <Text style={styles.modalListRowPath}>{item.pluginName}</Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
+              </>
+            ) : null}
+
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButton} onPress={() => setSnippetVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -1870,6 +3752,13 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
+    paddingVertical: 6,
+    paddingLeft: 6,
+    paddingRight: 2,
+  },
+  headerActionsScroll: {
+    flex: 1,
+    marginLeft: 10,
   },
   headerButton: {
     paddingHorizontal: 8,
@@ -1956,6 +3845,55 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 8,
   },
+  bulkBar: {
+    borderBottomWidth: 1,
+    borderBottomColor: "#555555",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    gap: 8,
+  },
+  bulkBarText: {
+    color: "#FFFFFF",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 12,
+  },
+  bulkButton: {
+    borderWidth: 1,
+    borderColor: "#555555",
+    backgroundColor: "#000000",
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    alignItems: "center",
+  },
+  bulkButtonText: {
+    color: "#FFFFFF",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 12,
+  },
+  bulkButtonDanger: {
+    borderWidth: 1,
+    borderColor: "#FF003C",
+    backgroundColor: "#000000",
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    alignItems: "center",
+  },
+  bulkButtonDangerText: {
+    color: "#FF003C",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 12,
+  },
+  selectionToggle: {
+    borderBottomWidth: 1,
+    borderBottomColor: "#555555",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  selectionToggleText: {
+    color: "#00FF41",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 12,
+  },
   tabStrip: {
     borderBottomWidth: 1,
     borderBottomColor: "#555555",
@@ -2016,9 +3954,94 @@ const styles = StyleSheet.create({
   editorArea: {
     flex: 1,
   },
+  editorSurfaceRow: {
+    flex: 1,
+    flexDirection: "row",
+    minHeight: 0,
+  },
+  editorSurfaceMain: {
+    flex: 1,
+    minWidth: 0,
+  },
   webview: {
     flex: 1,
     backgroundColor: "#000000",
+  },
+  miniMapWrap: {
+    width: 84,
+    borderLeftWidth: 1,
+    borderLeftColor: "#555555",
+    backgroundColor: "#000000",
+  },
+  miniMapTitle: {
+    color: "#00FF41",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: "#555555",
+    paddingHorizontal: 6,
+    paddingVertical: 4,
+  },
+  miniMapScroll: {
+    flex: 1,
+    paddingHorizontal: 6,
+    paddingTop: 4,
+  },
+  miniMapLine: {
+    color: "#555555",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 8,
+    lineHeight: 10,
+  },
+  outlinePanel: {
+    position: "absolute",
+    top: 8,
+    right: 8,
+    width: 220,
+    maxHeight: 260,
+    borderWidth: 1,
+    borderColor: "#555555",
+    backgroundColor: "#000000",
+  },
+  outlineHeader: {
+    minHeight: 30,
+    borderBottomWidth: 1,
+    borderBottomColor: "#555555",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 8,
+  },
+  outlineTitle: {
+    color: "#00FF41",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 11,
+  },
+  outlineCloseText: {
+    color: "#FF003C",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 11,
+  },
+  outlineScroll: {
+    maxHeight: 228,
+  },
+  outlineRow: {
+    borderBottomWidth: 1,
+    borderBottomColor: "#555555",
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+  },
+  outlineRowText: {
+    color: "#FFFFFF",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 11,
+  },
+  outlineEmpty: {
+    color: "#555555",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 11,
+    paddingHorizontal: 8,
+    paddingVertical: 8,
   },
   toolbarWrap: {
     minHeight: 46,
@@ -2117,6 +4140,31 @@ const styles = StyleSheet.create({
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 13,
   },
+  pluginCard: {
+    borderWidth: 1,
+    borderColor: "#555555",
+    marginHorizontal: 12,
+    marginBottom: 10,
+    backgroundColor: "#000000",
+    padding: 8,
+    gap: 6,
+  },
+  pluginTitle: {
+    color: "#00FF41",
+    fontFamily: "SpaceGrotesk_700Bold",
+    fontSize: 13,
+  },
+  pluginCommandButton: {
+    borderWidth: 1,
+    borderColor: "#555555",
+    paddingHorizontal: 8,
+    paddingVertical: 7,
+  },
+  pluginCommandText: {
+    color: "#FFFFFF",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 12,
+  },
   resetButton: {
     borderWidth: 1,
     borderColor: "#FF003C",
@@ -2165,6 +4213,9 @@ const styles = StyleSheet.create({
     backgroundColor: "#000000",
     padding: 12,
   },
+  modalCardTall: {
+    maxHeight: "92%",
+  },
   modalTitle: {
     color: "#FFFFFF",
     fontFamily: "SpaceGrotesk_700Bold",
@@ -2186,6 +4237,149 @@ const styles = StyleSheet.create({
     fontSize: 13,
     paddingHorizontal: 8,
     paddingVertical: 8,
+  },
+  modalInputTopGap: {
+    marginTop: 8,
+  },
+  inlineInputRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginTop: 8,
+  },
+  inlineInput: {
+    flex: 1,
+  },
+  modalActionsStrip: {
+    marginTop: 10,
+  },
+  modalActionsStripContent: {
+    alignItems: "center",
+    gap: 8,
+    paddingBottom: 2,
+  },
+  modalSectionLabel: {
+    color: "#00FF41",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 11,
+    marginTop: 10,
+    marginBottom: 6,
+  },
+  modalList: {
+    maxHeight: 140,
+    borderWidth: 1,
+    borderColor: "#555555",
+    backgroundColor: "#000000",
+  },
+  modalListRow: {
+    borderBottomWidth: 1,
+    borderBottomColor: "#555555",
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+  },
+  modalListRowTitle: {
+    color: "#FFFFFF",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 12,
+  },
+  modalListRowPath: {
+    color: "#555555",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 11,
+    marginTop: 2,
+  },
+  historyRowText: {
+    color: "#FFFFFF",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: "#555555",
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+  },
+  searchBusyText: {
+    color: "#00FF41",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 12,
+    marginTop: 8,
+    marginBottom: 4,
+  },
+  searchResultRow: {
+    borderBottomWidth: 1,
+    borderBottomColor: "#555555",
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+  },
+  searchResultTitle: {
+    color: "#FFFFFF",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 12,
+  },
+  searchResultPath: {
+    color: "#555555",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 11,
+    marginTop: 2,
+  },
+  searchResultSnippet: {
+    color: "#00FF41",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 11,
+    marginTop: 4,
+  },
+  trackerRow: {
+    borderBottomWidth: 1,
+    borderBottomColor: "#555555",
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+  },
+  trackerRowTitle: {
+    color: "#FFFFFF",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 12,
+  },
+  trackerRowPath: {
+    color: "#555555",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 11,
+    marginTop: 2,
+  },
+  commitRow: {
+    borderBottomWidth: 1,
+    borderBottomColor: "#555555",
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+  },
+  commitRowTitle: {
+    color: "#FFFFFF",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 12,
+  },
+  commitRowMeta: {
+    color: "#555555",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 11,
+    marginTop: 2,
+  },
+  terminalLogWrap: {
+    borderWidth: 1,
+    borderColor: "#555555",
+    maxHeight: 260,
+    backgroundColor: "#000000",
+    marginTop: 6,
+  },
+  terminalLine: {
+    color: "#FFFFFF",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  terminalLineError: {
+    color: "#FF003C",
+  },
+  terminalLineInput: {
+    color: "#00FF41",
   },
   actionMenuList: {
     gap: 8,

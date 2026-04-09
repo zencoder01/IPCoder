@@ -93,6 +93,7 @@ type BridgeMessage =
   | { type: "setTabSize"; payload: { size: number } }
   | { type: "setFontSize"; payload: { size: number } }
   | { type: "setLineNumbers"; payload: { enabled: boolean } }
+  | { type: "setCursor"; payload: { line: number; col?: number } }
   | {
       type: "search";
       payload: SearchPayload;
@@ -389,6 +390,19 @@ const handleBridgeMessage = (raw: unknown) => {
       view.dispatch({
         effects: lineNumberCompartment.reconfigure(lineNumberExtensions(message.payload.enabled)),
       });
+      break;
+    }
+    case "setCursor": {
+      const requestedLine = Math.max(1, Math.floor(message.payload.line || 1));
+      const requestedCol = Math.max(1, Math.floor(message.payload.col || 1));
+      const safeLine = Math.min(requestedLine, view.state.doc.lines);
+      const line = view.state.doc.line(safeLine);
+      const head = Math.min(line.from + requestedCol - 1, line.to);
+
+      view.dispatch({
+        selection: EditorSelection.single(head),
+      });
+      view.focus();
       break;
     }
     case "search": {

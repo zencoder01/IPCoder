@@ -16,11 +16,36 @@ Offline-first mobile code editor for Android built with React Native (Expo) and 
 - Brutalist terminal UI (black/white/green/red palette, hard separators, zero radius)
 - File Manager with breadcrumb navigation and local directory browsing
 - Recent files list (max 20 persisted entries)
+- Pinned folders
+- Multi-select mode with bulk move/delete
 - Multi-tab editor (max 8 tabs) with unsaved `*` indicator
-- Toolbar actions: Undo, Redo, Search, Word Wrap, Indent, Comment, Theme toggle
+- Toolbar actions: Undo, Redo, Search, Word Wrap, Indent, Comment, Theme toggle, Format, Snippets, Command Palette, Outline, MiniMap
 - Inline Search Palette with search/replace + case/regex/whole-word toggles
+- Command Palette with quick-open, go-to-line, plugin command launcher, and command history
+- Workspace search + replace across files
+- Local tracker (init, stage, commit log)
+- Built-in terminal panel (`help`, `pwd`, `ls`, `cat`, `touch`, `mkdir`, `rm`, `mv`, `echo`)
+- Snippet library + plugin-provided insert snippets
+- Path protection + read-only mode guardrails
+- Lightweight outline panel + minimap preview
 - Bottom status bar: language, UTF-8, tab size, Ln/Col
 - Settings screen with categorized toggles and reset-to-defaults
+
+## Local Plugins
+
+Place plugin JSON files under `workspace/.ipcoder/plugins/*.json`.
+
+```json
+{
+  "id": "example-tools",
+  "name": "Example Tools",
+  "commands": [
+    { "id": "insert-header", "label": "Insert Header", "type": "insertText", "payload": "// header\n" },
+    { "id": "open-readme", "label": "Open README", "type": "openFile", "payload": "README.md" },
+    { "id": "hello", "label": "Show Hello", "type": "showMessage", "payload": "Hello from plugin" }
+  ]
+}
+```
 
 ## Local Development
 
