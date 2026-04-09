@@ -203,6 +203,15 @@ interface GithubFileSyncState {
   lastSyncAt: number;
 }
 
+interface RestorePoint {
+  id: string;
+  filePath: string;
+  fileName: string;
+  content: string;
+  label: string;
+  timestamp: number;
+}
+
 const STORAGE_SETTINGS_KEY = "ipcoder.settings.v1";
 const STORAGE_RECENTS_KEY = "ipcoder.recents.v1";
 const STORAGE_SESSION_KEY = "ipcoder.session.v1";
@@ -212,6 +221,7 @@ const STORAGE_PINNED_FOLDERS_KEY = "ipcoder.pinned-folders.v1";
 const STORAGE_PROTECTED_PATHS_KEY = "ipcoder.protected-paths.v1";
 const STORAGE_EXTERNAL_SAVE_DIR_KEY = "ipcoder.external-save-dir.v1";
 const STORAGE_GITHUB_FILE_SYNC_STATE_KEY = "ipcoder.github-file-sync-state.v1";
+const STORAGE_RESTORE_POINTS_KEY = "ipcoder.restore-points.v1";
 
 const DOCUMENT_ROOT =
   FileSystem.documentDirectory ?? FileSystem.cacheDirectory ?? "file:///tmp";
@@ -224,6 +234,7 @@ const MAX_SEARCH_RESULTS = 200;
 const MAX_TERMINAL_LINES = 250;
 const MAX_AI_MESSAGES = 40;
 const DRAWER_WIDTH = 280;
+const MAX_RESTORE_POINTS = 120;
 
 const THEME_ORDER: EditorTheme[] = ["one-dark", "dracula", "github-light"];
 
@@ -969,6 +980,8 @@ function IPCoderApp() {
     hashes: {},
     lastSyncAt: 0,
   });
+  const [historyVisible, setHistoryVisible] = useState<boolean>(false);
+  const [restorePoints, setRestorePoints] = useState<RestorePoint[]>([]);
   const drawerTranslateX = useRef(new Animated.Value(DRAWER_WIDTH)).current;
   const drawerScrimOpacity = useRef(new Animated.Value(0)).current;
 
@@ -1046,6 +1059,12 @@ function IPCoderApp() {
     await AsyncStorage.setItem(STORAGE_GITHUB_FILE_SYNC_STATE_KEY, JSON.stringify(next));
   }, []);
 
+  const persistRestorePoints = useCallback(async (next: RestorePoint[]) => {
+    const trimmed = next.slice(0, MAX_RESTORE_POINTS);
+    setRestorePoints(trimmed);
+    await AsyncStorage.setItem(STORAGE_RESTORE_POINTS_KEY, JSON.stringify(trimmed));
+  }, []);
+
   const addCommandHistory = useCallback(
     async (label: string) => {
       const next = [
@@ -1059,6 +1078,31 @@ function IPCoderApp() {
       await persistCommandHistory(next);
     },
     [commandHistory, persistCommandHistory],
+  );
+
+  const addRestorePoint = useCallback(
+    async (path: string, fileName: string, content: string, label: string) => {
+      const next: RestorePoint[] = [
+        {
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          filePath: path,
+          fileName,
+          content,
+          label,
+          timestamp: Date.now(),
+        },
+        ...restorePoints.filter(
+          (entry) =>
+            !(
+              entry.filePath === path &&
+              entry.content === content &&
+              Math.abs(Date.now() - entry.timestamp) < 1500
+            ),
+        ),
+      ];
+      await persistRestorePoints(next);
+    },
+    [persistRestorePoints, restorePoints],
   );
 
   const appendTerminalLog = useCallback((type: TerminalLogEntry["type"], text: string) => {
@@ -1456,6 +1500,7 @@ function IPCoderApp() {
           savedProtectedRaw,
           savedExternalSaveDirRaw,
           savedGithubFileSyncStateRaw,
+          savedRestorePointsRaw,
         ] = await Promise.all([
           AsyncStorage.getItem(STORAGE_SETTINGS_KEY),
           AsyncStorage.getItem(STORAGE_RECENTS_KEY),
@@ -1466,6 +1511,7 @@ function IPCoderApp() {
           AsyncStorage.getItem(STORAGE_PROTECTED_PATHS_KEY),
           AsyncStorage.getItem(STORAGE_EXTERNAL_SAVE_DIR_KEY),
           AsyncStorage.getItem(STORAGE_GITHUB_FILE_SYNC_STATE_KEY),
+          AsyncStorage.getItem(STORAGE_RESTORE_POINTS_KEY),
         ]);
 
         if (savedSettingsRaw) {
@@ -1573,6 +1619,26 @@ function IPCoderApp() {
                   : {},
               lastSyncAt: typeof parsed.lastSyncAt === "number" ? parsed.lastSyncAt : 0,
             });
+          }
+        }
+
+        if (savedRestorePointsRaw && !cancelled) {
+          const parsed = JSON.parse(savedRestorePointsRaw) as RestorePoint[];
+          if (Array.isArray(parsed)) {
+            setRestorePoints(
+              parsed
+                .filter(
+                  (item): item is RestorePoint =>
+                    !!item &&
+                    typeof item.id === "string" &&
+                    typeof item.filePath === "string" &&
+                    typeof item.fileName === "string" &&
+                    typeof item.content === "string" &&
+                    typeof item.label === "string" &&
+                    typeof item.timestamp === "number",
+                )
+                .slice(0, MAX_RESTORE_POINTS),
+            );
           }
         }
 
@@ -1867,6 +1933,14 @@ function IPCoderApp() {
 
     try {
       const isExternal = activeTab.path.startsWith("content://");
+      if (activeTab.savedContent !== activeTab.content) {
+        await addRestorePoint(
+          activeTab.path,
+          activeTab.name,
+          activeTab.savedContent,
+          "pre-save",
+        );
+      }
       if (!isExternal) {
         await backupFileIfNeeded(activeTab.path, activeTab.savedContent);
       }
@@ -1909,6 +1983,7 @@ function IPCoderApp() {
     }
   }, [
     activeTab,
+    addRestorePoint,
     addCommandHistory,
     appendAppLog,
     backupFileIfNeeded,
@@ -1932,6 +2007,64 @@ function IPCoderApp() {
       await performSaveActiveTab();
     },
     [activeTab, performSaveActiveTab],
+  );
+
+  const visibleRestorePoints = useMemo(() => {
+    if (!activeTab) {
+      return restorePoints;
+    }
+    const forTab = restorePoints.filter((item) => item.filePath === activeTab.path);
+    return forTab.length ? forTab : restorePoints;
+  }, [activeTab, restorePoints]);
+
+  const restoreFromPoint = useCallback(
+    async (point: RestorePoint) => {
+      if (readOnlyMode || isProtectedPath(point.filePath)) {
+        Alert.alert("Restore", "Path is read-only or protected.");
+        return;
+      }
+
+      try {
+        if (point.filePath.startsWith("content://")) {
+          await FileSystem.StorageAccessFramework.writeAsStringAsync(
+            point.filePath,
+            point.content,
+            {
+              encoding: FileSystem.EncodingType.UTF8,
+            },
+          );
+        } else {
+          await FileSystem.writeAsStringAsync(point.filePath, point.content, {
+            encoding: FileSystem.EncodingType.UTF8,
+          });
+        }
+
+        setTabs((prev) =>
+          prev.map((tab) =>
+            tab.path === point.filePath
+              ? {
+                  ...tab,
+                  content: point.content,
+                  savedContent: point.content,
+                }
+              : tab,
+          ),
+        );
+
+        if (!point.filePath.startsWith("content://")) {
+          await refreshCurrentDirectory();
+        }
+
+        appendAppLog("info", `Restored ${point.fileName} from ${point.label} point.`);
+        await addCommandHistory(`Restore ${point.fileName}`);
+        Alert.alert("Restore", "Restore point applied.");
+      } catch (error) {
+        console.error(error);
+        appendAppLog("error", `Restore error: ${String(error)}`);
+        Alert.alert("Restore", "Failed to apply restore point.");
+      }
+    },
+    [addCommandHistory, appendAppLog, isProtectedPath, readOnlyMode, refreshCurrentDirectory],
   );
 
   const closeTab = useCallback(
@@ -4546,6 +4679,9 @@ ${activeTab.content.slice(0, 18000)}`
           <Pressable style={styles.modalButton} onPress={() => setLogVisible(true)}>
             <Text style={styles.modalButtonText}>App Logs</Text>
           </Pressable>
+          <Pressable style={styles.modalButton} onPress={() => setHistoryVisible(true)}>
+            <Text style={styles.modalButtonText}>Restore Timeline</Text>
+          </Pressable>
         </View>
 
         <Text style={styles.sectionLabel}>System</Text>
@@ -4829,6 +4965,12 @@ ${activeTab.content.slice(0, 18000)}`
                 onPress={() => runMenuAction(() => setLogVisible(true))}
               >
                 <Text style={styles.drawerButtonText}>[L] App Logs</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => runMenuAction(() => setHistoryVisible(true))}
+              >
+                <Text style={styles.drawerButtonText}>[R] Restore Timeline</Text>
               </Pressable>
             </ScrollView>
           </Animated.View>
@@ -5716,6 +5858,64 @@ ${activeTab.content.slice(0, 18000)}`
         </View>
       </Modal>
 
+      <Modal visible={historyVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>Restore Timeline</Text>
+            <Text style={styles.modalPath}>
+              {activeTab ? `Active: ${activeTab.name}` : "All files"}
+            </Text>
+            <ScrollView style={[styles.modalList, styles.modalListTall]}>
+              {visibleRestorePoints.length ? (
+                visibleRestorePoints.map((point) => (
+                  <Pressable
+                    key={point.id}
+                    style={styles.modalListRow}
+                    onPress={() => {
+                      Alert.alert(
+                        "Apply Restore Point?",
+                        `${point.fileName} • ${point.label}\n${new Date(point.timestamp).toLocaleString()}`,
+                        [
+                          { text: "Cancel", style: "cancel" },
+                          {
+                            text: "Restore",
+                            style: "destructive",
+                            onPress: () => {
+                              void restoreFromPoint(point);
+                            },
+                          },
+                        ],
+                      );
+                    }}
+                  >
+                    <Text style={styles.modalListRowTitle}>{point.fileName}</Text>
+                    <Text style={styles.modalListRowPath}>
+                      {point.label} • {new Date(point.timestamp).toLocaleString()}
+                    </Text>
+                    <Text style={styles.modalListRowPath}>{formatRelativePath(point.filePath)}</Text>
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No restore points yet.</Text>
+              )}
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  void persistRestorePoints([]);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Clear</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setHistoryVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
       <Modal visible={githubSyncVisible} transparent animationType="none">
         <View style={styles.modalBackdrop}>
           <View style={[styles.modalCard, styles.modalCardTall]}>
@@ -5727,6 +5927,9 @@ ${activeTab.content.slice(0, 18000)}`
             </Text>
             <Text style={styles.settingHint}>
               Sync root: {resolveGithubSyncRootPath(settings.githubSyncPath)}
+            </Text>
+            <Text style={styles.settingHint}>
+              Last file sync: {githubFileSyncState.lastSyncAt ? new Date(githubFileSyncState.lastSyncAt).toLocaleString() : "never"}
             </Text>
             <View style={styles.modalActions}>
               <Pressable
