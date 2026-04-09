@@ -20,7 +20,7 @@
         "foregroundImage": "./assets/ipcoder-logo.jpg",
         "backgroundColor": "#000000"
       },
-      "edgeToEdgeEnabled": true,
+      "edgeToEdgeEnabled": false,
       "predictiveBackGestureEnabled": false
     },
     "web": {

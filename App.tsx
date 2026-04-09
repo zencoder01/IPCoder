@@ -5,7 +5,6 @@ import {
   Modal,
   Platform,
   Pressable,
-  SafeAreaView,
   ScrollView,
   StatusBar,
   StyleSheet,
@@ -26,6 +25,7 @@ import {
   SpaceGrotesk_700Bold,
 } from "@expo-google-fonts/space-grotesk";
 import { WebView } from "react-native-webview";
+import { SafeAreaProvider, useSafeAreaInsets } from "react-native-safe-area-context";
 
 type ScreenName = "home" | "editor" | "settings";
 type EditorTheme = "one-dark" | "dracula" | "github-light";
@@ -260,9 +260,10 @@ const formatRelativePath = (path: string) => {
   return `workspace/${cleanPath.replace(`${cleanRoot}/`, "")}`;
 };
 
-export default function App() {
+function IPCoderApp() {
   const webviewRef = useRef<WebView>(null);
   const syncedTabForWebViewRef = useRef<string | null>(null);
+  const insets = useSafeAreaInsets();
 
   const [fontsLoaded] = useFonts({
     SpaceGrotesk_400Regular,
@@ -1187,18 +1188,34 @@ export default function App() {
 
   if (!fontsLoaded || !editorHtml) {
     return (
-      <SafeAreaView style={styles.container}>
-        <StatusBar barStyle="light-content" />
+      <View
+        style={[
+          styles.container,
+          {
+            paddingTop: insets.top,
+            paddingBottom: Math.max(insets.bottom, 8),
+          },
+        ]}
+      >
+        <StatusBar barStyle="light-content" backgroundColor="#000000" translucent={false} />
         <View style={styles.loadingWrap}>
           <Text style={styles.loadingText}>{loadingState || "Loading local assets..."}</Text>
         </View>
-      </SafeAreaView>
+      </View>
     );
   }
 
   return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="light-content" />
+    <View
+      style={[
+        styles.container,
+        {
+          paddingTop: insets.top,
+          paddingBottom: Math.max(insets.bottom, 8),
+        },
+      ]}
+    >
+      <StatusBar barStyle="light-content" backgroundColor="#000000" translucent={false} />
 
       {screen === "home" ? renderHomeScreen() : null}
       {screen === "editor" ? renderEditorScreen() : null}
@@ -1227,7 +1244,15 @@ export default function App() {
           </View>
         </View>
       </Modal>
-    </SafeAreaView>
+    </View>
+  );
+}
+
+export default function App() {
+  return (
+    <SafeAreaProvider>
+      <IPCoderApp />
+    </SafeAreaProvider>
   );
 }
 
