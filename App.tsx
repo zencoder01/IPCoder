@@ -98,8 +98,27 @@ interface SearchState {
   wholeWord: boolean;
 }
 
+interface PersistedSessionTab {
+  id: string;
+  path: string;
+  name: string;
+  language: EditorLanguage;
+  content: string;
+  savedContent: string;
+  line: number;
+  col: number;
+}
+
+interface PersistedSession {
+  tabs: PersistedSessionTab[];
+  activeTabId: string | null;
+  currentDirectory: string;
+  timestamp: number;
+}
+
 const STORAGE_SETTINGS_KEY = "ipcoder.settings.v1";
 const STORAGE_RECENTS_KEY = "ipcoder.recents.v1";
+const STORAGE_SESSION_KEY = "ipcoder.session.v1";
 
 const DOCUMENT_ROOT =
   FileSystem.documentDirectory ?? FileSystem.cacheDirectory ?? "file:///tmp";
@@ -297,6 +316,60 @@ const dedupeRecentsByPath = (items: RecentFile[]) => {
   return next.slice(0, MAX_RECENT_FILES);
 };
 
+const isValidLanguage = (value: unknown): value is EditorLanguage => {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const allowed: EditorLanguage[] = [
+    "javascript",
+    "typescript",
+    "python",
+    "html",
+    "css",
+    "json",
+    "markdown",
+    "sql",
+    "bash",
+    "c",
+    "cpp",
+    "java",
+    "php",
+    "rust",
+    "go",
+    "text",
+  ];
+  return allowed.includes(value as EditorLanguage);
+};
+
+const coercePersistedTab = (value: unknown): PersistedSessionTab | null => {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const candidate = value as Partial<PersistedSessionTab>;
+  if (
+    typeof candidate.id !== "string" ||
+    typeof candidate.path !== "string" ||
+    typeof candidate.name !== "string" ||
+    !isValidLanguage(candidate.language) ||
+    typeof candidate.content !== "string" ||
+    typeof candidate.savedContent !== "string"
+  ) {
+    return null;
+  }
+
+  return {
+    id: candidate.id,
+    path: candidate.path,
+    name: candidate.name,
+    language: candidate.language,
+    content: candidate.content,
+    savedContent: candidate.savedContent,
+    line: typeof candidate.line === "number" && candidate.line > 0 ? candidate.line : 1,
+    col: typeof candidate.col === "number" && candidate.col > 0 ? candidate.col : 1,
+  };
+};
+
 function IPCoderApp() {
   const webviewRef = useRef<WebView>(null);
   const syncedTabForWebViewRef = useRef<string | null>(null);
@@ -330,10 +403,15 @@ function IPCoderApp() {
   const [selectedEntry, setSelectedEntry] = useState<FileEntry | null>(null);
   const [renameModalVisible, setRenameModalVisible] = useState<boolean>(false);
   const [renameValue, setRenameValue] = useState<string>("");
+  const [sessionHydrated, setSessionHydrated] = useState<boolean>(false);
 
   const activeTab = useMemo(
     () => tabs.find((tab) => tab.id === activeTabId) ?? null,
     [tabs, activeTabId],
+  );
+  const unsavedPathSet = useMemo(
+    () => new Set(tabs.filter((tab) => tab.content !== tab.savedContent).map((tab) => tab.path)),
+    [tabs],
   );
 
   const editorHtml = useMemo(() => {
@@ -521,9 +599,10 @@ function IPCoderApp() {
 
     const bootstrap = async () => {
       try {
-        const [savedSettingsRaw, savedRecentsRaw] = await Promise.all([
+        const [savedSettingsRaw, savedRecentsRaw, savedSessionRaw] = await Promise.all([
           AsyncStorage.getItem(STORAGE_SETTINGS_KEY),
           AsyncStorage.getItem(STORAGE_RECENTS_KEY),
+          AsyncStorage.getItem(STORAGE_SESSION_KEY),
         ]);
 
         if (savedSettingsRaw) {
@@ -541,9 +620,40 @@ function IPCoderApp() {
         }
 
         await createWorkspaceIfMissing();
+
+        if (savedSessionRaw) {
+          const parsed = JSON.parse(savedSessionRaw) as Partial<PersistedSession>;
+          const sessionTabs = Array.isArray(parsed.tabs)
+            ? parsed.tabs
+                .map(coercePersistedTab)
+                .filter((item): item is PersistedSessionTab => item !== null)
+                .filter((item) => pathIsWithin(item.path, WORKSPACE_ROOT))
+                .slice(0, MAX_TABS)
+            : [];
+
+          if (!cancelled) {
+            if (sessionTabs.length) {
+              setTabs(sessionTabs);
+              const preferredActive =
+                typeof parsed.activeTabId === "string"
+                  ? sessionTabs.find((tab) => tab.id === parsed.activeTabId)?.id ?? null
+                  : null;
+              setActiveTabId(preferredActive ?? sessionTabs[0].id);
+            }
+
+            if (
+              typeof parsed.currentDirectory === "string" &&
+              pathIsWithin(parsed.currentDirectory, WORKSPACE_ROOT)
+            ) {
+              setCurrentDirectory(parsed.currentDirectory);
+            }
+          }
+        }
+
         await loadOfflineEditorAssets();
         if (!cancelled) {
           setLoadingState("");
+          setSessionHydrated(true);
         }
       } catch (error) {
         console.error(error);
@@ -551,6 +661,10 @@ function IPCoderApp() {
           "Bootstrap Error",
           "Failed to initialize offline editor assets. Verify local bundle generation.",
         );
+      } finally {
+        if (!cancelled) {
+          setSessionHydrated(true);
+        }
       }
     };
 
@@ -564,6 +678,36 @@ function IPCoderApp() {
   useEffect(() => {
     void refreshCurrentDirectory();
   }, [refreshCurrentDirectory]);
+
+  useEffect(() => {
+    if (!sessionHydrated) {
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      const payload: PersistedSession = {
+        tabs: tabs.map((tab) => ({
+          id: tab.id,
+          path: tab.path,
+          name: tab.name,
+          language: tab.language,
+          content: tab.content,
+          savedContent: tab.savedContent,
+          line: tab.line,
+          col: tab.col,
+        })),
+        activeTabId,
+        currentDirectory,
+        timestamp: Date.now(),
+      };
+
+      void AsyncStorage.setItem(STORAGE_SESSION_KEY, JSON.stringify(payload));
+    }, 300);
+
+    return () => {
+      clearTimeout(timeout);
+    };
+  }, [activeTabId, currentDirectory, sessionHydrated, tabs]);
 
   useEffect(() => {
     if (!editorReady) {
@@ -1195,7 +1339,10 @@ function IPCoderApp() {
                 Alert.alert("Missing File", "Recent file no longer exists in workspace.");
               }}
             >
-              <Text style={styles.fileRowName}>{item.name}</Text>
+              <Text style={styles.fileRowName}>
+                {item.name}
+                {unsavedPathSet.has(item.path) ? " [DRAFT]" : ""}
+              </Text>
               <Text style={styles.fileRowPath}>{formatRelativePath(item.path)}</Text>
             </Pressable>
           ))
@@ -1229,8 +1376,14 @@ function IPCoderApp() {
             onLongPress={() => openEntryActionMenu(entry)}
             delayLongPress={250}
           >
-            <Text style={entry.isDirectory ? styles.fileRowDirectory : styles.fileRowName}>
+            <Text
+              style={[
+                entry.isDirectory ? styles.fileRowDirectory : styles.fileRowName,
+                !entry.isDirectory && unsavedPathSet.has(entry.path) ? styles.fileRowDraft : null,
+              ]}
+            >
               {entry.isDirectory ? `[DIR] ${entry.name}` : entry.name}
+              {!entry.isDirectory && unsavedPathSet.has(entry.path) ? " [DRAFT]" : ""}
             </Text>
             <Text style={styles.fileRowPath}>{formatRelativePath(entry.path)}</Text>
           </Pressable>
@@ -1792,6 +1945,9 @@ const styles = StyleSheet.create({
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginTop: 2,
+  },
+  fileRowDraft: {
+    color: "#FF003C",
   },
   listHintText: {
     color: "#555555",
