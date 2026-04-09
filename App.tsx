@@ -798,7 +798,7 @@ function IPCoderApp() {
           useNativeDriver: true,
         }),
         Animated.timing(drawerScrimOpacity, {
-          toValue: 1,
+          toValue: 0.28,
           duration: 180,
           easing: Easing.out(Easing.cubic),
           useNativeDriver: true,
@@ -2086,6 +2086,21 @@ ${activeTab.content.slice(0, 18000)}`
       }
     },
     [activeTabId, tabs, touchRecentFile],
+  );
+
+  const openExternalEntry = useCallback(
+    async (entry: ExternalBrowserEntry) => {
+      try {
+        await FileSystem.StorageAccessFramework.readDirectoryAsync(entry.uri);
+        await navigateExternalBrowserTo(entry.uri);
+        return;
+      } catch {
+        // Not a readable directory. Fall through to file open.
+      }
+
+      await openExternalFile(entry.uri);
+    },
+    [navigateExternalBrowserTo, openExternalFile],
   );
 
   const goToLine = useCallback(
@@ -4569,11 +4584,7 @@ ${activeTab.content.slice(0, 18000)}`
                     key={entry.uri}
                     style={styles.modalListRow}
                     onPress={() => {
-                      if (entry.isDirectory) {
-                        void navigateExternalBrowserTo(entry.uri);
-                        return;
-                      }
-                      void openExternalFile(entry.uri);
+                      void openExternalEntry(entry);
                     }}
                   >
                     <Text style={styles.modalListRowTitle}>
