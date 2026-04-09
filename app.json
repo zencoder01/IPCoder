@@ -4,11 +4,11 @@
     "slug": "ipcoder",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/ipcoder-logo.jpg",
+    "icon": "./assets/1775713538338.png",
     "userInterfaceStyle": "dark",
     "newArchEnabled": true,
     "splash": {
-      "image": "./assets/ipcoder-logo.jpg",
+      "image": "./assets/1775713538338.png",
       "resizeMode": "contain",
       "backgroundColor": "#000000"
     },
@@ -17,7 +17,7 @@
     },
     "android": {
       "adaptiveIcon": {
-        "foregroundImage": "./assets/ipcoder-logo.jpg",
+        "foregroundImage": "./assets/1775713538338.png",
         "backgroundColor": "#000000"
       },
       "edgeToEdgeEnabled": false,
