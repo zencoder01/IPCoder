@@ -32,6 +32,10 @@ Offline-first mobile code editor for Android built with React Native (Expo) and 
 - Online AI assistant panel (OpenAI API key + model, prompt history, apply AI output to editor)
 - Save Copy flow to Android local storage / SD card folders via SAF directory permissions
 - External folder mount card + SAF external folder browser modal
+- GitHub sync panel (push/pull workspace snapshots via GitHub Contents API)
+- Project templates (React Web, Node CLI, Python Tool, C++ CMake)
+- Diff-before-save modal with line-level preview
+- In-app log console for app/file/sync diagnostics
 - Bottom status bar: language, UTF-8, tab size, Ln/Col
 - Settings screen with categorized toggles and reset-to-defaults
 

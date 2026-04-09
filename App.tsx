@@ -68,6 +68,11 @@ interface AppSettings {
   showHiddenFiles: boolean;
   aiModel: string;
   aiApiKey: string;
+  githubOwner: string;
+  githubRepo: string;
+  githubBranch: string;
+  githubToken: string;
+  githubSyncPath: string;
 }
 
 interface FileEntry {
@@ -179,6 +184,20 @@ interface ExternalBrowserEntry {
   isDirectory: boolean;
 }
 
+interface AppLogEntry {
+  id: string;
+  level: "info" | "error";
+  message: string;
+  timestamp: number;
+}
+
+interface ProjectTemplate {
+  id: string;
+  name: string;
+  description: string;
+  files: Record<string, string>;
+}
+
 const STORAGE_SETTINGS_KEY = "ipcoder.settings.v1";
 const STORAGE_RECENTS_KEY = "ipcoder.recents.v1";
 const STORAGE_SESSION_KEY = "ipcoder.session.v1";
@@ -211,7 +230,169 @@ const DEFAULT_SETTINGS: AppSettings = {
   showHiddenFiles: false,
   aiModel: "gpt-4.1-mini",
   aiApiKey: "",
+  githubOwner: "",
+  githubRepo: "",
+  githubBranch: "main",
+  githubToken: "",
+  githubSyncPath: ".ipcoder-sync/workspace.json",
 };
+
+const PROJECT_TEMPLATES: ProjectTemplate[] = [
+  {
+    id: "react-web",
+    name: "React Web Starter",
+    description: "index.html + src scaffold",
+    files: {
+      "index.html": `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IPCoder React Starter</title>
+    <link rel="stylesheet" href="./src/styles.css" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./src/main.jsx"></script>
+  </body>
+</html>
+`,
+      "src/main.jsx": `import React from "react";
+import { createRoot } from "react-dom/client";
+import { App } from "./App";
+
+createRoot(document.getElementById("root")).render(<App />);
+`,
+      "src/App.jsx": `export function App() {
+  return (
+    <main>
+      <h1>IPCoder React Starter</h1>
+      <p>Edit src/App.jsx</p>
+    </main>
+  );
+}
+`,
+      "src/styles.css": `:root {
+  color-scheme: dark;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  background: #111;
+  color: #fff;
+}
+
+main {
+  padding: 24px;
+}
+`,
+      "package.json": `{
+  "name": "ipcoder-react-starter",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}
+`,
+    },
+  },
+  {
+    id: "node-cli",
+    name: "Node CLI Starter",
+    description: "Node entrypoint + script config",
+    files: {
+      "src/index.js": `#!/usr/bin/env node
+
+function main() {
+  const args = process.argv.slice(2);
+  console.log("IPCoder Node starter", { args });
+}
+
+main();
+`,
+      "README.md": `# Node CLI Starter
+
+\`\`\`bash
+npm install
+npm start -- hello
+\`\`\`
+`,
+      "package.json": `{
+  "name": "ipcoder-node-cli",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  }
+}
+`,
+    },
+  },
+  {
+    id: "python-tool",
+    name: "Python Tool Starter",
+    description: "Python package-like layout",
+    files: {
+      "main.py": `from src.app import run
+
+
+if __name__ == "__main__":
+    run()
+`,
+      "src/app.py": `def run() -> None:
+    print("IPCoder Python starter")
+`,
+      "requirements.txt": `# Add dependencies here
+`,
+      "README.md": `# Python Starter
+
+\`\`\`bash
+python main.py
+\`\`\`
+`,
+    },
+  },
+  {
+    id: "cpp-cmake",
+    name: "C++ CMake Starter",
+    description: "Basic C++ project with CMake",
+    files: {
+      "src/main.cpp": `#include <iostream>
+
+int main() {
+  std::cout << "IPCoder C++ starter" << std::endl;
+  return 0;
+}
+`,
+      "CMakeLists.txt": `cmake_minimum_required(VERSION 3.16)
+project(ipcoder_cpp_starter LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(ipcoder_cpp src/main.cpp)
+`,
+      "README.md": `# C++ Starter
+
+\`\`\`bash
+cmake -S . -B build
+cmake --build build
+./build/ipcoder_cpp
+\`\`\`
+`,
+    },
+  },
+];
 
 const DEFAULT_SEARCH_STATE: SearchState = {
   query: "",
@@ -622,6 +803,62 @@ const extractFirstCodeBlock = (value: string) => {
   return match[1].trim();
 };
 
+const encodeGithubPath = (path: string) =>
+  path
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+
+const computeLineDiff = (beforeText: string, afterText: string) => {
+  const before = beforeText.split("\n");
+  const after = afterText.split("\n");
+  const output: Array<{ type: "same" | "add" | "del"; text: string }> = [];
+
+  let i = 0;
+  let j = 0;
+
+  while (i < before.length || j < after.length) {
+    const left = before[i];
+    const right = after[j];
+
+    if (left === right) {
+      if (typeof left === "string") {
+        output.push({ type: "same", text: left });
+      }
+      i += 1;
+      j += 1;
+      continue;
+    }
+
+    const nextLeft = before[i + 1];
+    const nextRight = after[j + 1];
+
+    if (typeof left === "string" && left === nextRight) {
+      output.push({ type: "add", text: right ?? "" });
+      j += 1;
+      continue;
+    }
+
+    if (typeof right === "string" && nextLeft === right) {
+      output.push({ type: "del", text: left ?? "" });
+      i += 1;
+      continue;
+    }
+
+    if (typeof left === "string") {
+      output.push({ type: "del", text: left });
+      i += 1;
+    }
+    if (typeof right === "string") {
+      output.push({ type: "add", text: right });
+      j += 1;
+    }
+  }
+
+  return output.slice(0, 600);
+};
+
 function IPCoderApp() {
   const webviewRef = useRef<WebView>(null);
   const syncedTabForWebViewRef = useRef<string | null>(null);
@@ -699,8 +936,34 @@ function IPCoderApp() {
   const [externalBrowserBusy, setExternalBrowserBusy] = useState<boolean>(false);
   const [externalBrowserEntries, setExternalBrowserEntries] = useState<ExternalBrowserEntry[]>([]);
   const [externalBrowserStack, setExternalBrowserStack] = useState<string[]>([]);
+  const [projectTemplateVisible, setProjectTemplateVisible] = useState<boolean>(false);
+  const [projectTemplateName, setProjectTemplateName] = useState<string>("new-project");
+  const [diffVisible, setDiffVisible] = useState<boolean>(false);
+  const [logVisible, setLogVisible] = useState<boolean>(false);
+  const [appLogs, setAppLogs] = useState<AppLogEntry[]>([]);
+  const [githubSyncVisible, setGithubSyncVisible] = useState<boolean>(false);
+  const [githubOwnerDraft, setGithubOwnerDraft] = useState<string>(DEFAULT_SETTINGS.githubOwner);
+  const [githubRepoDraft, setGithubRepoDraft] = useState<string>(DEFAULT_SETTINGS.githubRepo);
+  const [githubBranchDraft, setGithubBranchDraft] = useState<string>(DEFAULT_SETTINGS.githubBranch);
+  const [githubTokenDraft, setGithubTokenDraft] = useState<string>(DEFAULT_SETTINGS.githubToken);
+  const [githubSyncPathDraft, setGithubSyncPathDraft] = useState<string>(DEFAULT_SETTINGS.githubSyncPath);
+  const [githubSyncBusy, setGithubSyncBusy] = useState<boolean>(false);
   const drawerTranslateX = useRef(new Animated.Value(DRAWER_WIDTH)).current;
   const drawerScrimOpacity = useRef(new Animated.Value(0)).current;
+
+  const appendAppLog = useCallback((level: AppLogEntry["level"], message: string) => {
+    setAppLogs((prev) =>
+      [
+        {
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          level,
+          message,
+          timestamp: Date.now(),
+        },
+        ...prev,
+      ].slice(0, 400),
+    );
+  }, []);
 
   const activeTab = useMemo(
     () => tabs.find((tab) => tab.id === activeTabId) ?? null,
@@ -710,6 +973,12 @@ function IPCoderApp() {
     () => new Set(tabs.filter((tab) => tab.content !== tab.savedContent).map((tab) => tab.path)),
     [tabs],
   );
+  const diffPreviewLines = useMemo(() => {
+    if (!activeTab || activeTab.content === activeTab.savedContent) {
+      return [] as Array<{ type: "same" | "add" | "del"; text: string }>;
+    }
+    return computeLineDiff(activeTab.savedContent, activeTab.content);
+  }, [activeTab]);
 
   const editorHtml = useMemo(() => {
     if (!bundleCode || !jetbrainsFontBase64) {
@@ -1051,11 +1320,12 @@ function IPCoderApp() {
       setEntries(visible);
     } catch (error) {
       console.error(error);
+      appendAppLog("error", `Directory refresh error: ${String(error)}`);
       setEntries([]);
     } finally {
       setLoadingState("");
     }
-  }, [currentDirectory, settings.showHiddenFiles]);
+  }, [appendAppLog, currentDirectory, settings.showHiddenFiles]);
 
   const createWorkspaceIfMissing = useCallback(async () => {
     await FileSystem.makeDirectoryAsync(WORKSPACE_ROOT, { intermediates: true });
@@ -1177,6 +1447,11 @@ function IPCoderApp() {
             setSettings(merged);
             setAiApiKeyDraft(merged.aiApiKey);
             setAiModelDraft(merged.aiModel);
+            setGithubOwnerDraft(merged.githubOwner);
+            setGithubRepoDraft(merged.githubRepo);
+            setGithubBranchDraft(merged.githubBranch);
+            setGithubTokenDraft(merged.githubToken);
+            setGithubSyncPathDraft(merged.githubSyncPath);
           }
         }
 
@@ -1294,6 +1569,7 @@ function IPCoderApp() {
         }
       } catch (error) {
         console.error(error);
+        appendAppLog("error", `Bootstrap error: ${String(error)}`);
         Alert.alert(
           "Bootstrap Error",
           "Failed to initialize offline editor assets. Verify local bundle generation.",
@@ -1310,7 +1586,7 @@ function IPCoderApp() {
     return () => {
       cancelled = true;
     };
-  }, [createWorkspaceIfMissing, loadLocalPlugins, loadOfflineEditorAssets]);
+  }, [appendAppLog, createWorkspaceIfMissing, loadLocalPlugins, loadOfflineEditorAssets]);
 
   useEffect(() => {
     void refreshCurrentDirectory();
@@ -1355,7 +1631,20 @@ function IPCoderApp() {
   useEffect(() => {
     setAiApiKeyDraft(settings.aiApiKey);
     setAiModelDraft(settings.aiModel);
-  }, [settings.aiApiKey, settings.aiModel]);
+    setGithubOwnerDraft(settings.githubOwner);
+    setGithubRepoDraft(settings.githubRepo);
+    setGithubBranchDraft(settings.githubBranch);
+    setGithubTokenDraft(settings.githubToken);
+    setGithubSyncPathDraft(settings.githubSyncPath);
+  }, [
+    settings.aiApiKey,
+    settings.aiModel,
+    settings.githubBranch,
+    settings.githubOwner,
+    settings.githubRepo,
+    settings.githubSyncPath,
+    settings.githubToken,
+  ]);
 
   useEffect(() => {
     if (!editorReady) {
@@ -1497,10 +1786,11 @@ function IPCoderApp() {
         await touchRecentFile(path);
       } catch (error) {
         console.error(error);
+        appendAppLog("error", `Open file error (${path}): ${String(error)}`);
         Alert.alert("Open Error", "Unable to open the selected file.");
       }
     },
-    [activeTabId, tabs, touchRecentFile],
+    [activeTabId, appendAppLog, tabs, touchRecentFile],
   );
 
   const backupFileIfNeeded = useCallback(async (path: string, content: string) => {
@@ -1520,7 +1810,7 @@ function IPCoderApp() {
     }
   }, []);
 
-  const saveActiveTab = useCallback(async () => {
+  const performSaveActiveTab = useCallback(async () => {
     if (!activeTab) {
       return;
     }
@@ -1565,19 +1855,38 @@ function IPCoderApp() {
         await refreshCurrentDirectory();
       }
       await addCommandHistory(`Save ${activeTab.name}`);
+      appendAppLog("info", `Saved ${activeTab.name}`);
     } catch (error) {
       console.error(error);
+      appendAppLog("error", `Save Error: ${String(error)}`);
       Alert.alert("Save Error", "Unable to save the current file.");
     }
   }, [
     activeTab,
     addCommandHistory,
+    appendAppLog,
     backupFileIfNeeded,
     isProtectedPath,
     readOnlyMode,
     refreshCurrentDirectory,
     touchRecentFile,
   ]);
+
+  const saveActiveTab = useCallback(
+    async (options?: { skipDiff?: boolean }) => {
+      if (!activeTab) {
+        return;
+      }
+
+      if (!options?.skipDiff && activeTab.content !== activeTab.savedContent) {
+        setDiffVisible(true);
+        return;
+      }
+
+      await performSaveActiveTab();
+    },
+    [activeTab, performSaveActiveTab],
+  );
 
   const closeTab = useCallback(
     (tabId: string) => {
@@ -1741,8 +2050,307 @@ function IPCoderApp() {
       aiModel: nextModel,
       aiApiKey: nextKey,
     });
+    appendAppLog("info", "AI configuration updated.");
     Alert.alert("AI Settings", "AI model and API key saved locally.");
-  }, [aiApiKeyDraft, aiModelDraft, persistSettings, settings]);
+  }, [aiApiKeyDraft, aiModelDraft, appendAppLog, persistSettings, settings]);
+
+  const saveGithubConfiguration = useCallback(async () => {
+    await persistSettings({
+      ...settings,
+      githubOwner: githubOwnerDraft.trim(),
+      githubRepo: githubRepoDraft.trim(),
+      githubBranch: githubBranchDraft.trim() || "main",
+      githubToken: githubTokenDraft.trim(),
+      githubSyncPath: githubSyncPathDraft.trim() || ".ipcoder-sync/workspace.json",
+    });
+    appendAppLog("info", "GitHub sync configuration updated.");
+    Alert.alert("GitHub Sync", "Repository settings saved.");
+  }, [
+    appendAppLog,
+    githubBranchDraft,
+    githubOwnerDraft,
+    githubRepoDraft,
+    githubSyncPathDraft,
+    githubTokenDraft,
+    persistSettings,
+    settings,
+  ]);
+
+  const encodeStringToBase64 = useCallback(async (value: string) => {
+    const tempPath = joinFsPath(
+      DOCUMENT_ROOT,
+      `.ipcoder-sync-temp-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`,
+    );
+    try {
+      await FileSystem.writeAsStringAsync(tempPath, value, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+      return await FileSystem.readAsStringAsync(tempPath, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+    } finally {
+      await FileSystem.deleteAsync(tempPath, { idempotent: true }).catch(() => {});
+    }
+  }, []);
+
+  const decodeBase64ToString = useCallback(async (value: string) => {
+    const tempPath = joinFsPath(
+      DOCUMENT_ROOT,
+      `.ipcoder-sync-temp-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`,
+    );
+    try {
+      await FileSystem.writeAsStringAsync(tempPath, value.replace(/\n/g, ""), {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      return await FileSystem.readAsStringAsync(tempPath, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+    } finally {
+      await FileSystem.deleteAsync(tempPath, { idempotent: true }).catch(() => {});
+    }
+  }, []);
+
+  const buildWorkspaceSnapshot = useCallback(async () => {
+    const files = (await listWorkspaceFiles())
+      .filter((entry) => !entry.isDirectory)
+      .filter((entry) => pathIsWithin(entry.path, WORKSPACE_ROOT))
+      .filter((entry) => !entry.path.includes("/.ipcoder/backups/"))
+      .sort((left, right) => left.path.localeCompare(right.path));
+
+    const snapshotFiles: Array<{ path: string; content: string }> = [];
+    for (const entry of files) {
+      const content = await readFileAsTextSafe(entry.path);
+      if (content === null) {
+        continue;
+      }
+      snapshotFiles.push({
+        path: entry.path.replace(`${stripTrailingSlash(WORKSPACE_ROOT)}/`, ""),
+        content,
+      });
+    }
+
+    return JSON.stringify(
+      {
+        version: 1,
+        timestamp: Date.now(),
+        files: snapshotFiles,
+      },
+      null,
+      2,
+    );
+  }, [listWorkspaceFiles, readFileAsTextSafe]);
+
+  const pushWorkspaceSnapshotToGithub = useCallback(async () => {
+    const owner = settings.githubOwner.trim();
+    const repo = settings.githubRepo.trim();
+    const branch = settings.githubBranch.trim() || "main";
+    const token = settings.githubToken.trim();
+    const syncPath = settings.githubSyncPath.trim() || ".ipcoder-sync/workspace.json";
+
+    if (!owner || !repo || !token) {
+      Alert.alert("GitHub Sync", "Set owner, repo, and token in settings.");
+      return;
+    }
+
+    setGithubSyncBusy(true);
+    try {
+      const snapshot = await buildWorkspaceSnapshot();
+      const contentB64 = await encodeStringToBase64(snapshot);
+      const pathEncoded = encodeGithubPath(syncPath);
+      const fileUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${pathEncoded}`;
+      const headers = {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      };
+
+      let existingSha: string | undefined;
+      const existingRes = await fetch(`${fileUrl}?ref=${encodeURIComponent(branch)}`, {
+        method: "GET",
+        headers,
+      });
+      if (existingRes.ok) {
+        const payload = (await existingRes.json()) as { sha?: string };
+        existingSha = payload.sha;
+      } else if (existingRes.status !== 404) {
+        const text = await existingRes.text();
+        throw new Error(`GitHub read failed (${existingRes.status}): ${text}`);
+      }
+
+      const putRes = await fetch(fileUrl, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({
+          message: `IPCoder sync ${new Date().toISOString()}`,
+          content: contentB64,
+          branch,
+          sha: existingSha,
+        }),
+      });
+
+      if (!putRes.ok) {
+        const text = await putRes.text();
+        throw new Error(`GitHub push failed (${putRes.status}): ${text}`);
+      }
+
+      appendAppLog("info", `GitHub push completed (${owner}/${repo}@${branch}).`);
+      await addCommandHistory("GitHub Sync Push");
+      Alert.alert("GitHub Sync", "Workspace snapshot pushed.");
+    } catch (error) {
+      console.error(error);
+      appendAppLog("error", `GitHub push error: ${String(error)}`);
+      Alert.alert("GitHub Sync", "Push failed. Check token/repo/path permissions.");
+    } finally {
+      setGithubSyncBusy(false);
+    }
+  }, [
+    addCommandHistory,
+    appendAppLog,
+    buildWorkspaceSnapshot,
+    encodeStringToBase64,
+    settings.githubBranch,
+    settings.githubOwner,
+    settings.githubRepo,
+    settings.githubSyncPath,
+    settings.githubToken,
+  ]);
+
+  const pullWorkspaceSnapshotFromGithub = useCallback(async () => {
+    const owner = settings.githubOwner.trim();
+    const repo = settings.githubRepo.trim();
+    const branch = settings.githubBranch.trim() || "main";
+    const token = settings.githubToken.trim();
+    const syncPath = settings.githubSyncPath.trim() || ".ipcoder-sync/workspace.json";
+
+    if (!owner || !repo || !token) {
+      Alert.alert("GitHub Sync", "Set owner, repo, and token in settings.");
+      return;
+    }
+
+    setGithubSyncBusy(true);
+    try {
+      const pathEncoded = encodeGithubPath(syncPath);
+      const fileUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${pathEncoded}?ref=${encodeURIComponent(branch)}`;
+      const res = await fetch(fileUrl, {
+        method: "GET",
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization: `Bearer ${token}`,
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`GitHub pull failed (${res.status}): ${text}`);
+      }
+
+      const payload = (await res.json()) as { content?: string; encoding?: string };
+      if (!payload.content || payload.encoding !== "base64") {
+        throw new Error("Sync file is missing base64 content.");
+      }
+
+      const decoded = await decodeBase64ToString(payload.content);
+      const snapshot = JSON.parse(decoded) as {
+        files?: Array<{ path?: unknown; content?: unknown }>;
+      };
+
+      const files = Array.isArray(snapshot.files) ? snapshot.files : [];
+      for (const item of files) {
+        if (typeof item.path !== "string" || typeof item.content !== "string") {
+          continue;
+        }
+        if (!item.path || item.path.includes("..")) {
+          continue;
+        }
+        const destination = joinFsPath(WORKSPACE_ROOT, item.path);
+        const parent = parentPath(destination, WORKSPACE_ROOT);
+        await FileSystem.makeDirectoryAsync(parent, { intermediates: true });
+        await FileSystem.writeAsStringAsync(destination, item.content, {
+          encoding: FileSystem.EncodingType.UTF8,
+        });
+      }
+
+      await refreshCurrentDirectory();
+      appendAppLog("info", `GitHub pull completed (${owner}/${repo}@${branch}).`);
+      await addCommandHistory("GitHub Sync Pull");
+      Alert.alert("GitHub Sync", "Workspace snapshot pulled.");
+    } catch (error) {
+      console.error(error);
+      appendAppLog("error", `GitHub pull error: ${String(error)}`);
+      Alert.alert("GitHub Sync", "Pull failed. Check token/repo/path permissions.");
+    } finally {
+      setGithubSyncBusy(false);
+    }
+  }, [
+    addCommandHistory,
+    appendAppLog,
+    decodeBase64ToString,
+    refreshCurrentDirectory,
+    settings.githubBranch,
+    settings.githubOwner,
+    settings.githubRepo,
+    settings.githubSyncPath,
+    settings.githubToken,
+  ]);
+
+  const createProjectFromTemplate = useCallback(
+    async (template: ProjectTemplate) => {
+      const projectName = projectTemplateName.trim();
+      if (!projectName) {
+        Alert.alert("Template", "Enter a project folder name.");
+        return;
+      }
+      if (projectName.includes("/") || projectName.includes("\\")) {
+        Alert.alert("Template", "Project name cannot include / or \\.");
+        return;
+      }
+
+      const projectRoot = joinFsPath(currentDirectory, projectName);
+      if (readOnlyMode || isProtectedPath(projectRoot)) {
+        Alert.alert("Template", "Project path is read-only or protected.");
+        return;
+      }
+
+      try {
+        const info = await FileSystem.getInfoAsync(projectRoot);
+        if (info.exists) {
+          Alert.alert("Template", "Folder already exists.");
+          return;
+        }
+
+        await FileSystem.makeDirectoryAsync(projectRoot, { intermediates: true });
+        for (const [relative, content] of Object.entries(template.files)) {
+          const filePath = joinFsPath(projectRoot, relative);
+          const folderPath = parentPath(filePath, projectRoot);
+          await FileSystem.makeDirectoryAsync(folderPath, { intermediates: true });
+          await FileSystem.writeAsStringAsync(filePath, content, {
+            encoding: FileSystem.EncodingType.UTF8,
+          });
+        }
+
+        setProjectTemplateVisible(false);
+        setProjectTemplateName("new-project");
+        await refreshCurrentDirectory();
+        await addCommandHistory(`Template: ${template.name}`);
+        appendAppLog("info", `Template created: ${template.name} (${projectName})`);
+      } catch (error) {
+        console.error(error);
+        appendAppLog("error", `Template create error: ${String(error)}`);
+        Alert.alert("Template", "Failed to create project template.");
+      }
+    },
+    [
+      addCommandHistory,
+      appendAppLog,
+      currentDirectory,
+      isProtectedPath,
+      projectTemplateName,
+      readOnlyMode,
+      refreshCurrentDirectory,
+    ],
+  );
 
   const askAi = useCallback(async () => {
     if (aiBusy) {
@@ -1829,9 +2437,11 @@ ${activeTab.content.slice(0, 18000)}`
 
       pushAiMessage("assistant", content);
       await addCommandHistory(`AI Ask: ${userMessage.slice(0, 48)}`);
+      appendAppLog("info", `AI response generated (${model}).`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Request failed.";
       pushAiMessage("error", message);
+      appendAppLog("error", `AI error: ${message}`);
     } finally {
       setAiBusy(false);
     }
@@ -1841,6 +2451,7 @@ ${activeTab.content.slice(0, 18000)}`
     aiBusy,
     aiMessages,
     aiPrompt,
+    appendAppLog,
     pushAiMessage,
     settings.aiApiKey,
     settings.aiModel,
@@ -1898,11 +2509,13 @@ ${activeTab.content.slice(0, 18000)}`
       }
       setExternalSaveDirUri(result.directoryUri);
       await AsyncStorage.setItem(STORAGE_EXTERNAL_SAVE_DIR_KEY, result.directoryUri);
+      appendAppLog("info", "External folder permission granted.");
     } catch (error) {
       console.error(error);
+      appendAppLog("error", `External folder grant error: ${String(error)}`);
       Alert.alert("Save Copy", "Unable to request folder access.");
     }
-  }, [externalSaveDirUri]);
+  }, [appendAppLog, externalSaveDirUri]);
 
   const saveCopyToExternalDirectory = useCallback(async () => {
     if (!activeTab) {
@@ -1941,12 +2554,14 @@ ${activeTab.content.slice(0, 18000)}`
 
       setSaveCopyModalVisible(false);
       await addCommandHistory(`Save Copy ${requestedName}`);
+      appendAppLog("info", `Saved copy to external folder: ${requestedName}`);
       Alert.alert("Save Copy", "File copy saved to selected folder.");
     } catch (error) {
       console.error(error);
+      appendAppLog("error", `Save copy error: ${String(error)}`);
       Alert.alert("Save Copy", "Failed to save copy to selected folder.");
     }
-  }, [activeTab, addCommandHistory, externalSaveDirUri, saveCopyName]);
+  }, [activeTab, addCommandHistory, appendAppLog, externalSaveDirUri, saveCopyName]);
 
   const loadExternalDirectoryEntries = useCallback(async (directoryUri: string) => {
     setExternalBrowserBusy(true);
@@ -1988,14 +2603,16 @@ ${activeTab.content.slice(0, 18000)}`
       });
 
       setExternalBrowserEntries(mapped);
+      appendAppLog("info", `External folder loaded (${mapped.length} entries).`);
     } catch (error) {
       console.error(error);
       setExternalBrowserEntries([]);
+      appendAppLog("error", `External folder read error: ${String(error)}`);
       Alert.alert("External Folder", "Unable to read this folder.");
     } finally {
       setExternalBrowserBusy(false);
     }
-  }, []);
+  }, [appendAppLog]);
 
   const openExternalBrowser = useCallback(
     async (targetUri?: string) => {
@@ -2080,12 +2697,14 @@ ${activeTab.content.slice(0, 18000)}`
         setScreen("editor");
         setExternalBrowserVisible(false);
         await touchRecentFile(uri);
+        appendAppLog("info", `Opened external file: ${name}`);
       } catch (error) {
         console.error(error);
+        appendAppLog("error", `External file open error: ${String(error)}`);
         Alert.alert("External File", "Unable to open external file.");
       }
     },
-    [activeTabId, tabs, touchRecentFile],
+    [activeTabId, appendAppLog, tabs, touchRecentFile],
   );
 
   const openExternalEntry = useCallback(
@@ -3397,6 +4016,8 @@ ${activeTab.content.slice(0, 18000)}`
           {renderToolbarButton("Snippet", () => setSnippetVisible(true))}
           {renderToolbarButton("Cmd", () => setCommandPaletteVisible(true))}
           {renderToolbarButton("AI", () => setAiVisible(true))}
+          {renderToolbarButton("Diff", () => setDiffVisible(true))}
+          {renderToolbarButton("Logs", () => setLogVisible(true))}
           {renderToolbarButton(`Outline ${outlineVisible ? "ON" : "OFF"}`, () =>
             setOutlineVisible((prev) => !prev),
           )}
@@ -3619,6 +4240,77 @@ ${activeTab.content.slice(0, 18000)}`
           </View>
         </View>
 
+        <Text style={styles.sectionLabel}>GitHub Sync</Text>
+        <View style={styles.settingBlock}>
+          <TextInput
+            style={styles.settingInput}
+            value={githubOwnerDraft}
+            onChangeText={setGithubOwnerDraft}
+            autoCapitalize="none"
+            autoCorrect={false}
+            placeholder="Repo owner (e.g. zencoder01)"
+            placeholderTextColor="#555555"
+          />
+          <TextInput
+            style={[styles.settingInput, styles.settingInputTopGap]}
+            value={githubRepoDraft}
+            onChangeText={setGithubRepoDraft}
+            autoCapitalize="none"
+            autoCorrect={false}
+            placeholder="Repo name (e.g. IPCoder)"
+            placeholderTextColor="#555555"
+          />
+          <TextInput
+            style={[styles.settingInput, styles.settingInputTopGap]}
+            value={githubBranchDraft}
+            onChangeText={setGithubBranchDraft}
+            autoCapitalize="none"
+            autoCorrect={false}
+            placeholder="Branch (default main)"
+            placeholderTextColor="#555555"
+          />
+          <TextInput
+            style={[styles.settingInput, styles.settingInputTopGap]}
+            value={githubSyncPathDraft}
+            onChangeText={setGithubSyncPathDraft}
+            autoCapitalize="none"
+            autoCorrect={false}
+            placeholder=".ipcoder-sync/workspace.json"
+            placeholderTextColor="#555555"
+          />
+          <TextInput
+            style={[styles.settingInput, styles.settingInputTopGap]}
+            value={githubTokenDraft}
+            onChangeText={setGithubTokenDraft}
+            autoCapitalize="none"
+            autoCorrect={false}
+            secureTextEntry
+            placeholder="GitHub token (repo contents write)"
+            placeholderTextColor="#555555"
+          />
+          <View style={styles.settingActionRow}>
+            <Pressable style={styles.modalButtonPrimary} onPress={() => void saveGithubConfiguration()}>
+              <Text style={styles.modalButtonPrimaryText}>Save GitHub Config</Text>
+            </Pressable>
+            <Pressable style={styles.modalButton} onPress={() => setGithubSyncVisible(true)}>
+              <Text style={styles.modalButtonText}>Open Sync Panel</Text>
+            </Pressable>
+          </View>
+        </View>
+
+        <Text style={styles.sectionLabel}>Tools</Text>
+        <View style={styles.settingActionRowWrap}>
+          <Pressable style={styles.modalButton} onPress={() => setProjectTemplateVisible(true)}>
+            <Text style={styles.modalButtonText}>Project Templates</Text>
+          </Pressable>
+          <Pressable style={styles.modalButton} onPress={() => setDiffVisible(true)}>
+            <Text style={styles.modalButtonText}>Diff Viewer</Text>
+          </Pressable>
+          <Pressable style={styles.modalButton} onPress={() => setLogVisible(true)}>
+            <Text style={styles.modalButtonText}>App Logs</Text>
+          </Pressable>
+        </View>
+
         <Text style={styles.sectionLabel}>System</Text>
         <Pressable style={styles.settingRow} onPress={() => void toggleSetting("showHiddenFiles")}> 
           <Text style={styles.settingLabel}>
@@ -3826,6 +4518,12 @@ ${activeTab.content.slice(0, 18000)}`
               </Pressable>
               <Pressable
                 style={styles.drawerButton}
+                onPress={() => runMenuAction(() => setProjectTemplateVisible(true))}
+              >
+                <Text style={styles.drawerButtonText}>[P] Project Templates</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
                 onPress={() => runMenuAction(() => setTrackerVisible(true))}
               >
                 <Text style={styles.drawerButtonText}>[T] Tracker</Text>
@@ -3861,6 +4559,12 @@ ${activeTab.content.slice(0, 18000)}`
               >
                 <Text style={styles.drawerButtonText}>[C] Save Copy To Folder</Text>
               </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => runMenuAction(() => setDiffVisible(true))}
+              >
+                <Text style={styles.drawerButtonText}>[D] Diff Before Save</Text>
+              </Pressable>
 
               <Text style={styles.drawerSectionLabel}>External Storage</Text>
               <Pressable
@@ -3874,6 +4578,20 @@ ${activeTab.content.slice(0, 18000)}`
                 onPress={() => runMenuAction(() => void openExternalBrowser())}
               >
                 <Text style={styles.drawerButtonText}>[B] Browse Mounted Folder</Text>
+              </Pressable>
+
+              <Text style={styles.drawerSectionLabel}>Sync + Logs</Text>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => runMenuAction(() => setGithubSyncVisible(true))}
+              >
+                <Text style={styles.drawerButtonText}>[G] GitHub Sync</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => runMenuAction(() => setLogVisible(true))}
+              >
+                <Text style={styles.drawerButtonText}>[L] App Logs</Text>
               </Pressable>
             </ScrollView>
           </Animated.View>
@@ -4178,6 +4896,42 @@ ${activeTab.content.slice(0, 18000)}`
                 }}
               >
                 <Text style={styles.modalButtonText}>AI</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setProjectTemplateVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Template</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setDiffVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Diff</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setGithubSyncVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>GitHub</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setLogVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Logs</Text>
               </Pressable>
               <Pressable
                 style={styles.modalButton}
@@ -4598,6 +5352,172 @@ ${activeTab.content.slice(0, 18000)}`
                 <Text style={styles.emptyText}>Folder is empty or unreadable.</Text>
               )}
             </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={projectTemplateVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>Project Templates</Text>
+            <Text style={styles.modalPath}>{formatRelativePath(currentDirectory)}</Text>
+            <TextInput
+              style={styles.modalInput}
+              value={projectTemplateName}
+              onChangeText={setProjectTemplateName}
+              autoCapitalize="none"
+              autoCorrect={false}
+              placeholder="Project folder name"
+              placeholderTextColor="#555555"
+            />
+            <ScrollView style={[styles.modalList, styles.modalListTall]}>
+              {PROJECT_TEMPLATES.map((template) => (
+                <Pressable
+                  key={template.id}
+                  style={styles.modalListRow}
+                  onPress={() => {
+                    void createProjectFromTemplate(template);
+                  }}
+                >
+                  <Text style={styles.modalListRowTitle}>{template.name}</Text>
+                  <Text style={styles.modalListRowPath}>{template.description}</Text>
+                </Pressable>
+              ))}
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButton} onPress={() => setProjectTemplateVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={diffVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>Diff Before Save</Text>
+            <Text style={styles.modalPath}>{activeTab ? activeTab.name : "No active file"}</Text>
+            <ScrollView style={[styles.modalList, styles.modalListTall]}>
+              {!activeTab ? (
+                <Text style={styles.emptyText}>Open a file to view diff.</Text>
+              ) : activeTab.content === activeTab.savedContent ? (
+                <Text style={styles.emptyText}>No unsaved changes.</Text>
+              ) : (
+                diffPreviewLines.map((line, index) => (
+                  <Text
+                    key={`${index}-${line.type}`}
+                    style={[
+                      styles.diffLine,
+                      line.type === "add"
+                        ? styles.diffLineAdd
+                        : line.type === "del"
+                          ? styles.diffLineDel
+                          : styles.diffLineSame,
+                    ]}
+                  >
+                    {line.type === "add" ? "+" : line.type === "del" ? "-" : " "} {line.text}
+                  </Text>
+                ))
+              )}
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButton} onPress={() => setDiffVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButtonPrimary}
+                onPress={() => {
+                  setDiffVisible(false);
+                  void saveActiveTab({ skipDiff: true });
+                }}
+              >
+                <Text style={styles.modalButtonPrimaryText}>Save Now</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={logVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>App Logs</Text>
+            <ScrollView style={[styles.modalList, styles.modalListTall]}>
+              {appLogs.length ? (
+                appLogs.map((entry) => (
+                  <View key={entry.id} style={styles.logRow}>
+                    <Text
+                      style={[
+                        styles.logLevel,
+                        entry.level === "error" ? styles.logLevelError : styles.logLevelInfo,
+                      ]}
+                    >
+                      {entry.level.toUpperCase()}
+                    </Text>
+                    <Text style={styles.logText}>{new Date(entry.timestamp).toLocaleString()} | {entry.message}</Text>
+                  </View>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No logs yet.</Text>
+              )}
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setAppLogs([]);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Clear</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setLogVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={githubSyncVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>GitHub Sync</Text>
+            <Text style={styles.modalPath}>
+              {settings.githubOwner && settings.githubRepo
+                ? `${settings.githubOwner}/${settings.githubRepo} @ ${settings.githubBranch || "main"}`
+                : "Configure repository in Settings first."}
+            </Text>
+            <Text style={styles.settingHint}>
+              Sync path: {settings.githubSyncPath || ".ipcoder-sync/workspace.json"}
+            </Text>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={styles.modalButtonPrimary}
+                onPress={() => {
+                  void pushWorkspaceSnapshotToGithub();
+                }}
+              >
+                <Text style={styles.modalButtonPrimaryText}>
+                  {githubSyncBusy ? "Working..." : "Push Workspace Snapshot"}
+                </Text>
+              </Pressable>
+            </View>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  void pullWorkspaceSnapshotFromGithub();
+                }}
+              >
+                <Text style={styles.modalButtonText}>
+                  {githubSyncBusy ? "Working..." : "Pull Workspace Snapshot"}
+                </Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setGithubSyncVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
           </View>
         </View>
       </Modal>
@@ -5160,6 +6080,13 @@ const styles = StyleSheet.create({
     marginTop: 8,
     flexWrap: "wrap",
   },
+  settingActionRowWrap: {
+    flexDirection: "row",
+    gap: 8,
+    marginHorizontal: 12,
+    marginBottom: 12,
+    flexWrap: "wrap",
+  },
   settingValue: {
     color: "#FFFFFF",
     fontFamily: "JetBrainsMono_400Regular",
@@ -5378,6 +6305,9 @@ const styles = StyleSheet.create({
     borderColor: "#555555",
     backgroundColor: "#000000",
   },
+  modalListTall: {
+    maxHeight: 360,
+  },
   modalListRow: {
     borderBottomWidth: 1,
     borderBottomColor: "#555555",
@@ -5403,6 +6333,45 @@ const styles = StyleSheet.create({
     borderBottomColor: "#555555",
     paddingHorizontal: 8,
     paddingVertical: 8,
+  },
+  diffLine: {
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 11,
+    lineHeight: 16,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+  },
+  diffLineSame: {
+    color: "#AAAAAA",
+  },
+  diffLineAdd: {
+    color: "#00FF41",
+  },
+  diffLineDel: {
+    color: "#FF003C",
+  },
+  logRow: {
+    borderBottomWidth: 1,
+    borderBottomColor: "#555555",
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+  },
+  logLevel: {
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 10,
+    marginBottom: 4,
+  },
+  logLevelInfo: {
+    color: "#00FF41",
+  },
+  logLevelError: {
+    color: "#FF003C",
+  },
+  logText: {
+    color: "#FFFFFF",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 11,
+    lineHeight: 16,
   },
   searchBusyText: {
     color: "#00FF41",
