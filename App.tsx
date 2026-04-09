@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
+  Animated,
+  Easing,
   KeyboardAvoidingView,
   Modal,
   Platform,
@@ -196,6 +198,7 @@ const MAX_COMMAND_HISTORY = 30;
 const MAX_SEARCH_RESULTS = 200;
 const MAX_TERMINAL_LINES = 250;
 const MAX_AI_MESSAGES = 40;
+const DRAWER_WIDTH = 280;
 
 const THEME_ORDER: EditorTheme[] = ["one-dark", "dracula", "github-light"];
 
@@ -696,6 +699,8 @@ function IPCoderApp() {
   const [externalBrowserBusy, setExternalBrowserBusy] = useState<boolean>(false);
   const [externalBrowserEntries, setExternalBrowserEntries] = useState<ExternalBrowserEntry[]>([]);
   const [externalBrowserStack, setExternalBrowserStack] = useState<string[]>([]);
+  const drawerTranslateX = useRef(new Animated.Value(DRAWER_WIDTH)).current;
+  const drawerScrimOpacity = useRef(new Animated.Value(0)).current;
 
   const activeTab = useMemo(
     () => tabs.find((tab) => tab.id === activeTabId) ?? null,
@@ -774,6 +779,72 @@ function IPCoderApp() {
       return next.slice(-MAX_TERMINAL_LINES);
     });
   }, []);
+
+  const openMenu = useCallback(() => {
+    if (menuVisible) {
+      return;
+    }
+
+    setMenuVisible(true);
+    drawerTranslateX.setValue(DRAWER_WIDTH);
+    drawerScrimOpacity.setValue(0);
+
+    requestAnimationFrame(() => {
+      Animated.parallel([
+        Animated.timing(drawerTranslateX, {
+          toValue: 0,
+          duration: 180,
+          easing: Easing.out(Easing.cubic),
+          useNativeDriver: true,
+        }),
+        Animated.timing(drawerScrimOpacity, {
+          toValue: 1,
+          duration: 180,
+          easing: Easing.out(Easing.cubic),
+          useNativeDriver: true,
+        }),
+      ]).start();
+    });
+  }, [drawerScrimOpacity, drawerTranslateX, menuVisible]);
+
+  const closeMenu = useCallback(
+    (afterClose?: () => void) => {
+      if (!menuVisible) {
+        if (afterClose) {
+          afterClose();
+        }
+        return;
+      }
+
+      Animated.parallel([
+        Animated.timing(drawerTranslateX, {
+          toValue: DRAWER_WIDTH,
+          duration: 160,
+          easing: Easing.in(Easing.cubic),
+          useNativeDriver: true,
+        }),
+        Animated.timing(drawerScrimOpacity, {
+          toValue: 0,
+          duration: 160,
+          easing: Easing.in(Easing.cubic),
+          useNativeDriver: true,
+        }),
+      ]).start(() => {
+        setMenuVisible(false);
+        if (afterClose) {
+          afterClose();
+        }
+      });
+    },
+    [drawerScrimOpacity, drawerTranslateX, menuVisible],
+  );
+
+  const runMenuAction = useCallback(
+    (action: () => void) => {
+      closeMenu(action);
+    },
+    [closeMenu],
+  );
 
   const sendToEditor = useCallback((payload: Record<string, unknown>) => {
     if (!webviewRef.current) {
@@ -3064,7 +3135,7 @@ ${activeTab.content.slice(0, 18000)}`
     <View style={styles.screen}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>[IPCoder]</Text>
-        <Pressable style={styles.headerButton} onPress={() => setMenuVisible(true)}>
+        <Pressable style={styles.headerButton} onPress={() => openMenu()}>
           <Text style={styles.headerButtonText}>[MENU]</Text>
         </Pressable>
       </View>
@@ -3333,7 +3404,7 @@ ${activeTab.content.slice(0, 18000)}`
           <Pressable style={styles.headerButton} onPress={() => void saveActiveTab()}>
             <Text style={styles.headerButtonText}>[SAVE]</Text>
           </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => setMenuVisible(true)}>
+          <Pressable style={styles.headerButton} onPress={() => openMenu()}>
             <Text style={styles.headerButtonText}>[MENU]</Text>
           </Pressable>
         </View>
@@ -3451,7 +3522,7 @@ ${activeTab.content.slice(0, 18000)}`
           <Pressable style={styles.headerButton} onPress={() => setScreen("home")}> 
             <Text style={styles.headerButtonText}>[FILES]</Text>
           </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => setMenuVisible(true)}>
+          <Pressable style={styles.headerButton} onPress={() => openMenu()}>
             <Text style={styles.headerButtonText}>[MENU]</Text>
           </Pressable>
         </View>
@@ -3661,143 +3732,136 @@ ${activeTab.content.slice(0, 18000)}`
       {screen === "editor" ? renderEditorScreen() : null}
       {screen === "settings" ? renderSettingsScreen() : null}
 
-      <Modal visible={menuVisible} transparent animationType="none">
+      <Modal visible={menuVisible} transparent animationType="none" onRequestClose={() => closeMenu()}>
         <View style={styles.drawerRoot}>
-          <Pressable style={styles.drawerScrim} onPress={() => setMenuVisible(false)} />
-          <View style={styles.drawerPanel}>
-            <Text style={styles.drawerTitle}>[MENU]</Text>
+          <Animated.View style={[styles.drawerScrim, { opacity: drawerScrimOpacity }]}>
+            <Pressable style={styles.drawerScrimTouch} onPress={() => closeMenu()} />
+          </Animated.View>
+          <Animated.View
+            style={[styles.drawerPanel, { transform: [{ translateX: drawerTranslateX }] }]}
+          >
+            <View style={styles.drawerHeaderRow}>
+              <Text style={styles.drawerTitle}>[MENU]</Text>
+              <Pressable style={styles.drawerCloseButton} onPress={() => closeMenu()}>
+                <Text style={styles.drawerCloseText}>X</Text>
+              </Pressable>
+            </View>
+
+            <View style={styles.drawerStatusCard}>
+              <Text style={styles.drawerStatusText}>Screen: {screen.toUpperCase()}</Text>
+              <Text style={styles.drawerStatusText}>Tabs: {tabs.length}/{MAX_TABS}</Text>
+              <Text style={styles.drawerStatusText}>
+                External: {externalSaveDirUri ? "MOUNTED" : "NONE"}
+              </Text>
+            </View>
+
             <ScrollView style={styles.drawerList}>
+              <Text style={styles.drawerSectionLabel}>Navigate</Text>
               <Pressable
                 style={styles.drawerButton}
-                onPress={() => {
-                  setMenuVisible(false);
-                  setScreen("home");
-                }}
+                onPress={() => runMenuAction(() => setScreen("home"))}
               >
-                <Text style={styles.drawerButtonText}>File Manager</Text>
+                <Text style={styles.drawerButtonText}>[H] File Manager</Text>
               </Pressable>
               <Pressable
                 style={styles.drawerButton}
-                onPress={() => {
-                  setMenuVisible(false);
-                  if (tabs.length) {
+                onPress={() =>
+                  runMenuAction(() => {
+                    if (!tabs.length) {
+                      Alert.alert("Editor", "Open a file first.");
+                      return;
+                    }
                     setScreen("editor");
-                  }
-                }}
+                  })
+                }
               >
-                <Text style={styles.drawerButtonText}>Editor</Text>
+                <Text style={styles.drawerButtonText}>[E] Editor</Text>
               </Pressable>
               <Pressable
                 style={styles.drawerButton}
-                onPress={() => {
-                  setMenuVisible(false);
-                  setScreen("settings");
-                }}
+                onPress={() => runMenuAction(() => setScreen("settings"))}
               >
-                <Text style={styles.drawerButtonText}>Settings</Text>
+                <Text style={styles.drawerButtonText}>[S] Settings</Text>
+              </Pressable>
+
+              <Text style={styles.drawerSectionLabel}>Workspace</Text>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => runMenuAction(() => setNewFileModalVisible(true))}
+              >
+                <Text style={styles.drawerButtonText}>[+] New File</Text>
               </Pressable>
               <Pressable
                 style={styles.drawerButton}
-                onPress={() => {
-                  setMenuVisible(false);
-                  setNewFileModalVisible(true);
-                }}
+                onPress={() => runMenuAction(() => setNewFolderModalVisible(true))}
               >
-                <Text style={styles.drawerButtonText}>New File</Text>
+                <Text style={styles.drawerButtonText}>[+] New Folder</Text>
               </Pressable>
               <Pressable
                 style={styles.drawerButton}
-                onPress={() => {
-                  setMenuVisible(false);
-                  setNewFolderModalVisible(true);
-                }}
+                onPress={() => runMenuAction(() => setCommandPaletteVisible(true))}
               >
-                <Text style={styles.drawerButtonText}>New Folder</Text>
+                <Text style={styles.drawerButtonText}>[C] Command Palette</Text>
               </Pressable>
               <Pressable
                 style={styles.drawerButton}
-                onPress={() => {
-                  setMenuVisible(false);
-                  setCommandPaletteVisible(true);
-                }}
+                onPress={() => runMenuAction(() => setWorkspaceSearchVisible(true))}
               >
-                <Text style={styles.drawerButtonText}>Command Palette</Text>
+                <Text style={styles.drawerButtonText}>[F] Workspace Search</Text>
               </Pressable>
               <Pressable
                 style={styles.drawerButton}
-                onPress={() => {
-                  setMenuVisible(false);
-                  setWorkspaceSearchVisible(true);
-                }}
+                onPress={() => runMenuAction(() => setTrackerVisible(true))}
               >
-                <Text style={styles.drawerButtonText}>Workspace Search</Text>
+                <Text style={styles.drawerButtonText}>[T] Tracker</Text>
               </Pressable>
               <Pressable
                 style={styles.drawerButton}
-                onPress={() => {
-                  setMenuVisible(false);
-                  setTrackerVisible(true);
-                }}
+                onPress={() => runMenuAction(() => setTerminalVisible(true))}
               >
-                <Text style={styles.drawerButtonText}>Tracker</Text>
+                <Text style={styles.drawerButtonText}>[X] Terminal</Text>
               </Pressable>
               <Pressable
                 style={styles.drawerButton}
-                onPress={() => {
-                  setMenuVisible(false);
-                  setTerminalVisible(true);
-                }}
+                onPress={() => runMenuAction(() => setAiVisible(true))}
               >
-                <Text style={styles.drawerButtonText}>Terminal</Text>
+                <Text style={styles.drawerButtonText}>[A] AI Assistant</Text>
+              </Pressable>
+
+              <Text style={styles.drawerSectionLabel}>File Actions</Text>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => runMenuAction(() => void saveActiveTab())}
+              >
+                <Text style={styles.drawerButtonText}>[W] Save Active File</Text>
               </Pressable>
               <Pressable
                 style={styles.drawerButton}
-                onPress={() => {
-                  setMenuVisible(false);
-                  setAiVisible(true);
-                }}
+                onPress={() =>
+                  runMenuAction(() => {
+                    setSaveCopyName(activeTab?.name ?? "untitled.txt");
+                    setSaveCopyModalVisible(true);
+                  })
+                }
               >
-                <Text style={styles.drawerButtonText}>AI Assistant</Text>
+                <Text style={styles.drawerButtonText}>[C] Save Copy To Folder</Text>
+              </Pressable>
+
+              <Text style={styles.drawerSectionLabel}>External Storage</Text>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => runMenuAction(() => void pickExternalSaveDirectory())}
+              >
+                <Text style={styles.drawerButtonText}>[D] Choose Folder</Text>
               </Pressable>
               <Pressable
                 style={styles.drawerButton}
-                onPress={() => {
-                  setMenuVisible(false);
-                  void saveActiveTab();
-                }}
+                onPress={() => runMenuAction(() => void openExternalBrowser())}
               >
-                <Text style={styles.drawerButtonText}>Save Active File</Text>
-              </Pressable>
-              <Pressable
-                style={styles.drawerButton}
-                onPress={() => {
-                  setMenuVisible(false);
-                  setSaveCopyName(activeTab?.name ?? "untitled.txt");
-                  setSaveCopyModalVisible(true);
-                }}
-              >
-                <Text style={styles.drawerButtonText}>Save Copy To Folder</Text>
-              </Pressable>
-              <Pressable
-                style={styles.drawerButton}
-                onPress={() => {
-                  setMenuVisible(false);
-                  void pickExternalSaveDirectory();
-                }}
-              >
-                <Text style={styles.drawerButtonText}>Choose External Folder</Text>
-              </Pressable>
-              <Pressable
-                style={styles.drawerButton}
-                onPress={() => {
-                  setMenuVisible(false);
-                  void openExternalBrowser();
-                }}
-              >
-                <Text style={styles.drawerButtonText}>Browse External Folder</Text>
+                <Text style={styles.drawerButtonText}>[B] Browse Mounted Folder</Text>
               </Pressable>
             </ScrollView>
-          </View>
+          </Animated.View>
         </View>
       </Modal>
 
@@ -5154,25 +5218,68 @@ const styles = StyleSheet.create({
   drawerRoot: {
     flex: 1,
     flexDirection: "row",
-    backgroundColor: "rgba(0,0,0,0.7)",
   },
   drawerScrim: {
     flex: 1,
+    backgroundColor: "#000000",
+  },
+  drawerScrimTouch: {
+    flex: 1,
   },
   drawerPanel: {
-    width: 260,
+    width: DRAWER_WIDTH,
     borderLeftWidth: 1,
     borderLeftColor: "#555555",
     backgroundColor: "#000000",
-    paddingTop: 18,
+    paddingTop: 16,
     paddingBottom: 16,
     paddingHorizontal: 10,
+  },
+  drawerHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 10,
   },
   drawerTitle: {
     color: "#FFFFFF",
     fontFamily: "SpaceGrotesk_700Bold",
     fontSize: 16,
+  },
+  drawerCloseButton: {
+    borderWidth: 1,
+    borderColor: "#555555",
+    width: 30,
+    height: 30,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#000000",
+  },
+  drawerCloseText: {
+    color: "#FF003C",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 12,
+  },
+  drawerStatusCard: {
+    borderWidth: 1,
+    borderColor: "#555555",
+    paddingHorizontal: 8,
+    paddingVertical: 8,
     marginBottom: 10,
+    backgroundColor: "#000000",
+  },
+  drawerStatusText: {
+    color: "#FFFFFF",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 11,
+    marginBottom: 2,
+  },
+  drawerSectionLabel: {
+    color: "#555555",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 11,
+    marginBottom: 6,
+    marginTop: 8,
   },
   drawerList: {
     flex: 1,
@@ -5186,7 +5293,7 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   drawerButtonText: {
-    color: "#00FF41",
+    color: "#FFFFFF",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },

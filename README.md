@@ -18,7 +18,7 @@ Offline-first mobile code editor for Android built with React Native (Expo) and 
 - Recent files list (max 20 persisted entries)
 - Pinned folders
 - Multi-select mode with bulk move/delete
-- Hamburger sidebar menu for primary actions (files/editor/settings/tools)
+- Animated hamburger sidebar menu with grouped sections for primary actions
 - Multi-tab editor (max 8 tabs) with unsaved `*` indicator
 - Toolbar actions: Undo, Redo, Search, Word Wrap, Indent, Comment, Theme toggle, Format, Snippets, Command Palette, Outline, MiniMap
 - Inline Search Palette with search/replace + case/regex/whole-word toggles
