@@ -198,6 +198,11 @@ interface ProjectTemplate {
   files: Record<string, string>;
 }
 
+interface GithubFileSyncState {
+  hashes: Record<string, string>;
+  lastSyncAt: number;
+}
+
 const STORAGE_SETTINGS_KEY = "ipcoder.settings.v1";
 const STORAGE_RECENTS_KEY = "ipcoder.recents.v1";
 const STORAGE_SESSION_KEY = "ipcoder.session.v1";
@@ -206,6 +211,7 @@ const STORAGE_TRACKER_KEY = "ipcoder.tracker.v1";
 const STORAGE_PINNED_FOLDERS_KEY = "ipcoder.pinned-folders.v1";
 const STORAGE_PROTECTED_PATHS_KEY = "ipcoder.protected-paths.v1";
 const STORAGE_EXTERNAL_SAVE_DIR_KEY = "ipcoder.external-save-dir.v1";
+const STORAGE_GITHUB_FILE_SYNC_STATE_KEY = "ipcoder.github-file-sync-state.v1";
 
 const DOCUMENT_ROOT =
   FileSystem.documentDirectory ?? FileSystem.cacheDirectory ?? "file:///tmp";
@@ -234,7 +240,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   githubRepo: "",
   githubBranch: "main",
   githubToken: "",
-  githubSyncPath: ".ipcoder-sync/workspace.json",
+  githubSyncPath: ".ipcoder-sync/files",
 };
 
 const PROJECT_TEMPLATES: ProjectTemplate[] = [
@@ -810,6 +816,17 @@ const encodeGithubPath = (path: string) =>
     .map((segment) => encodeURIComponent(segment))
     .join("/");
 
+const resolveGithubSyncRootPath = (raw: string) => {
+  const value = raw.trim();
+  if (!value) {
+    return ".ipcoder-sync/files";
+  }
+  if (value.endsWith(".json")) {
+    return ".ipcoder-sync/files";
+  }
+  return value.replace(/^\/+/, "").replace(/\/+$/, "");
+};
+
 const computeLineDiff = (beforeText: string, afterText: string) => {
   const before = beforeText.split("\n");
   const after = afterText.split("\n");
@@ -948,6 +965,10 @@ function IPCoderApp() {
   const [githubTokenDraft, setGithubTokenDraft] = useState<string>(DEFAULT_SETTINGS.githubToken);
   const [githubSyncPathDraft, setGithubSyncPathDraft] = useState<string>(DEFAULT_SETTINGS.githubSyncPath);
   const [githubSyncBusy, setGithubSyncBusy] = useState<boolean>(false);
+  const [githubFileSyncState, setGithubFileSyncState] = useState<GithubFileSyncState>({
+    hashes: {},
+    lastSyncAt: 0,
+  });
   const drawerTranslateX = useRef(new Animated.Value(DRAWER_WIDTH)).current;
   const drawerScrimOpacity = useRef(new Animated.Value(0)).current;
 
@@ -1018,6 +1039,11 @@ function IPCoderApp() {
     const deduped = Array.from(new Set(next.filter((item) => pathIsWithin(item, WORKSPACE_ROOT))));
     setProtectedPaths(deduped);
     await AsyncStorage.setItem(STORAGE_PROTECTED_PATHS_KEY, JSON.stringify(deduped));
+  }, []);
+
+  const persistGithubFileSyncState = useCallback(async (next: GithubFileSyncState) => {
+    setGithubFileSyncState(next);
+    await AsyncStorage.setItem(STORAGE_GITHUB_FILE_SYNC_STATE_KEY, JSON.stringify(next));
   }, []);
 
   const addCommandHistory = useCallback(
@@ -1429,6 +1455,7 @@ function IPCoderApp() {
           savedPinnedRaw,
           savedProtectedRaw,
           savedExternalSaveDirRaw,
+          savedGithubFileSyncStateRaw,
         ] = await Promise.all([
           AsyncStorage.getItem(STORAGE_SETTINGS_KEY),
           AsyncStorage.getItem(STORAGE_RECENTS_KEY),
@@ -1438,6 +1465,7 @@ function IPCoderApp() {
           AsyncStorage.getItem(STORAGE_PINNED_FOLDERS_KEY),
           AsyncStorage.getItem(STORAGE_PROTECTED_PATHS_KEY),
           AsyncStorage.getItem(STORAGE_EXTERNAL_SAVE_DIR_KEY),
+          AsyncStorage.getItem(STORAGE_GITHUB_FILE_SYNC_STATE_KEY),
         ]);
 
         if (savedSettingsRaw) {
@@ -1528,6 +1556,24 @@ function IPCoderApp() {
 
         if (savedExternalSaveDirRaw && !cancelled) {
           setExternalSaveDirUri(savedExternalSaveDirRaw);
+        }
+
+        if (savedGithubFileSyncStateRaw && !cancelled) {
+          const parsed = JSON.parse(savedGithubFileSyncStateRaw) as Partial<GithubFileSyncState>;
+          if (parsed && typeof parsed === "object") {
+            setGithubFileSyncState({
+              hashes:
+                parsed.hashes && typeof parsed.hashes === "object"
+                  ? Object.fromEntries(
+                      Object.entries(parsed.hashes).filter(
+                        (entry): entry is [string, string] =>
+                          typeof entry[0] === "string" && typeof entry[1] === "string",
+                      ),
+                    )
+                  : {},
+              lastSyncAt: typeof parsed.lastSyncAt === "number" ? parsed.lastSyncAt : 0,
+            });
+          }
         }
 
         await createWorkspaceIfMissing();
@@ -2061,7 +2107,7 @@ function IPCoderApp() {
       githubRepo: githubRepoDraft.trim(),
       githubBranch: githubBranchDraft.trim() || "main",
       githubToken: githubTokenDraft.trim(),
-      githubSyncPath: githubSyncPathDraft.trim() || ".ipcoder-sync/workspace.json",
+      githubSyncPath: githubSyncPathDraft.trim() || ".ipcoder-sync/files",
     });
     appendAppLog("info", "GitHub sync configuration updated.");
     Alert.alert("GitHub Sync", "Repository settings saved.");
@@ -2110,42 +2156,182 @@ function IPCoderApp() {
     }
   }, []);
 
-  const buildWorkspaceSnapshot = useCallback(async () => {
+  const listWorkspaceTextFilesForSync = useCallback(async () => {
     const files = (await listWorkspaceFiles())
       .filter((entry) => !entry.isDirectory)
       .filter((entry) => pathIsWithin(entry.path, WORKSPACE_ROOT))
       .filter((entry) => !entry.path.includes("/.ipcoder/backups/"))
       .sort((left, right) => left.path.localeCompare(right.path));
 
-    const snapshotFiles: Array<{ path: string; content: string }> = [];
+    const collected: Array<{ relativePath: string; content: string }> = [];
     for (const entry of files) {
       const content = await readFileAsTextSafe(entry.path);
       if (content === null) {
         continue;
       }
-      snapshotFiles.push({
-        path: entry.path.replace(`${stripTrailingSlash(WORKSPACE_ROOT)}/`, ""),
-        content,
-      });
+      const relativePath = entry.path.replace(`${stripTrailingSlash(WORKSPACE_ROOT)}/`, "");
+      collected.push({ relativePath, content });
     }
-
-    return JSON.stringify(
-      {
-        version: 1,
-        timestamp: Date.now(),
-        files: snapshotFiles,
-      },
-      null,
-      2,
-    );
+    return collected;
   }, [listWorkspaceFiles, readFileAsTextSafe]);
 
-  const pushWorkspaceSnapshotToGithub = useCallback(async () => {
+  const githubHeaders = useCallback(
+    (token: string, withBody = false) =>
+      ({
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${token}`,
+        ...(withBody ? { "Content-Type": "application/json" } : {}),
+        "X-GitHub-Api-Version": "2022-11-28",
+      }) as Record<string, string>,
+    [],
+  );
+
+  const githubGetFile = useCallback(
+    async (
+      owner: string,
+      repo: string,
+      branch: string,
+      token: string,
+      path: string,
+    ): Promise<{ exists: false } | { exists: true; sha: string; content: string }> => {
+      const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeGithubPath(path)}?ref=${encodeURIComponent(branch)}`;
+      const res = await fetch(url, {
+        method: "GET",
+        headers: githubHeaders(token),
+      });
+
+      if (res.status === 404) {
+        return { exists: false };
+      }
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`GitHub read failed (${res.status}): ${text}`);
+      }
+
+      const payload = (await res.json()) as {
+        sha?: unknown;
+        content?: unknown;
+        encoding?: unknown;
+        type?: unknown;
+      };
+
+      if (
+        payload.type !== "file" ||
+        typeof payload.sha !== "string" ||
+        payload.encoding !== "base64" ||
+        typeof payload.content !== "string"
+      ) {
+        throw new Error(`GitHub path is not a readable file: ${path}`);
+      }
+
+      const decoded = await decodeBase64ToString(payload.content);
+      return {
+        exists: true,
+        sha: payload.sha,
+        content: decoded,
+      };
+    },
+    [decodeBase64ToString, githubHeaders],
+  );
+
+  const githubUpsertFile = useCallback(
+    async (
+      owner: string,
+      repo: string,
+      branch: string,
+      token: string,
+      path: string,
+      content: string,
+      sha?: string,
+    ) => {
+      const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeGithubPath(path)}`;
+      const base64 = await encodeStringToBase64(content);
+      const res = await fetch(url, {
+        method: "PUT",
+        headers: githubHeaders(token, true),
+        body: JSON.stringify({
+          message: `IPCoder sync update ${path}`,
+          content: base64,
+          branch,
+          ...(sha ? { sha } : {}),
+        }),
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`GitHub write failed (${res.status}): ${text}`);
+      }
+    },
+    [encodeStringToBase64, githubHeaders],
+  );
+
+  const githubListFilesRecursively = useCallback(
+    async (
+      owner: string,
+      repo: string,
+      branch: string,
+      token: string,
+      basePath: string,
+    ): Promise<Array<{ path: string }>> => {
+      const walk = async (path: string): Promise<Array<{ path: string }>> => {
+        const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeGithubPath(path)}?ref=${encodeURIComponent(branch)}`;
+        const res = await fetch(url, {
+          method: "GET",
+          headers: githubHeaders(token),
+        });
+
+        if (res.status === 404) {
+          return [];
+        }
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`GitHub list failed (${res.status}): ${text}`);
+        }
+
+        const payload = (await res.json()) as unknown;
+        if (!Array.isArray(payload)) {
+          return [];
+        }
+
+        const out: Array<{ path: string }> = [];
+        for (const item of payload as Array<{ type?: unknown; path?: unknown }>) {
+          if (!item || typeof item.path !== "string") {
+            continue;
+          }
+          if (item.type === "file") {
+            out.push({ path: item.path });
+            continue;
+          }
+          if (item.type === "dir") {
+            const nested = await walk(item.path);
+            out.push(...nested);
+          }
+        }
+        return out;
+      };
+
+      return walk(basePath);
+    },
+    [githubHeaders],
+  );
+
+  const buildConflictMarkers = useCallback((localText: string, remoteText: string) => {
+    return [
+      "<<<<<<< LOCAL",
+      localText,
+      "=======",
+      remoteText,
+      ">>>>>>> REMOTE",
+      "",
+    ].join("\n");
+  }, []);
+
+  const pushWorkspaceFilesToGithub = useCallback(async () => {
     const owner = settings.githubOwner.trim();
     const repo = settings.githubRepo.trim();
     const branch = settings.githubBranch.trim() || "main";
     const token = settings.githubToken.trim();
-    const syncPath = settings.githubSyncPath.trim() || ".ipcoder-sync/workspace.json";
+    const syncRoot = resolveGithubSyncRootPath(settings.githubSyncPath);
 
     if (!owner || !repo || !token) {
       Alert.alert("GitHub Sync", "Set owner, repo, and token in settings.");
@@ -2154,61 +2340,86 @@ function IPCoderApp() {
 
     setGithubSyncBusy(true);
     try {
-      const snapshot = await buildWorkspaceSnapshot();
-      const contentB64 = await encodeStringToBase64(snapshot);
-      const pathEncoded = encodeGithubPath(syncPath);
-      const fileUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${pathEncoded}`;
-      const headers = {
-        Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        "X-GitHub-Api-Version": "2022-11-28",
-      };
+      const files = await listWorkspaceTextFilesForSync();
+      const nextHashes = { ...githubFileSyncState.hashes };
+      let uploaded = 0;
+      let skipped = 0;
+      let conflicts = 0;
 
-      let existingSha: string | undefined;
-      const existingRes = await fetch(`${fileUrl}?ref=${encodeURIComponent(branch)}`, {
-        method: "GET",
-        headers,
-      });
-      if (existingRes.ok) {
-        const payload = (await existingRes.json()) as { sha?: string };
-        existingSha = payload.sha;
-      } else if (existingRes.status !== 404) {
-        const text = await existingRes.text();
-        throw new Error(`GitHub read failed (${existingRes.status}): ${text}`);
-      }
+      for (const file of files) {
+        const remotePath = `${syncRoot}/${file.relativePath}`;
+        const localHash = quickHash(file.content);
+        const baseHash = githubFileSyncState.hashes[file.relativePath];
 
-      const putRes = await fetch(fileUrl, {
-        method: "PUT",
-        headers,
-        body: JSON.stringify({
-          message: `IPCoder sync ${new Date().toISOString()}`,
-          content: contentB64,
+        const remote = await githubGetFile(owner, repo, branch, token, remotePath);
+        if (!remote.exists) {
+          await githubUpsertFile(owner, repo, branch, token, remotePath, file.content);
+          nextHashes[file.relativePath] = localHash;
+          uploaded += 1;
+          continue;
+        }
+
+        const remoteHash = quickHash(remote.content);
+        if (remoteHash === localHash) {
+          nextHashes[file.relativePath] = localHash;
+          skipped += 1;
+          continue;
+        }
+
+        const isConflict =
+          typeof baseHash === "string" &&
+          localHash !== baseHash &&
+          remoteHash !== baseHash &&
+          localHash !== remoteHash;
+
+        if (isConflict) {
+          conflicts += 1;
+          appendAppLog("error", `GitHub push conflict: ${file.relativePath}`);
+          continue;
+        }
+
+        await githubUpsertFile(
+          owner,
+          repo,
           branch,
-          sha: existingSha,
-        }),
-      });
-
-      if (!putRes.ok) {
-        const text = await putRes.text();
-        throw new Error(`GitHub push failed (${putRes.status}): ${text}`);
+          token,
+          remotePath,
+          file.content,
+          remote.sha,
+        );
+        nextHashes[file.relativePath] = localHash;
+        uploaded += 1;
       }
 
-      appendAppLog("info", `GitHub push completed (${owner}/${repo}@${branch}).`);
-      await addCommandHistory("GitHub Sync Push");
-      Alert.alert("GitHub Sync", "Workspace snapshot pushed.");
+      await persistGithubFileSyncState({
+        hashes: nextHashes,
+        lastSyncAt: Date.now(),
+      });
+
+      appendAppLog(
+        "info",
+        `GitHub per-file push done: ${uploaded} uploaded, ${skipped} unchanged, ${conflicts} conflicts.`,
+      );
+      await addCommandHistory("GitHub File Sync Push");
+      Alert.alert(
+        "GitHub Sync",
+        `Push complete.\nUploaded: ${uploaded}\nUnchanged: ${skipped}\nConflicts: ${conflicts}`,
+      );
     } catch (error) {
       console.error(error);
-      appendAppLog("error", `GitHub push error: ${String(error)}`);
-      Alert.alert("GitHub Sync", "Push failed. Check token/repo/path permissions.");
+      appendAppLog("error", `GitHub per-file push error: ${String(error)}`);
+      Alert.alert("GitHub Sync", "Per-file push failed.");
     } finally {
       setGithubSyncBusy(false);
     }
   }, [
     addCommandHistory,
     appendAppLog,
-    buildWorkspaceSnapshot,
-    encodeStringToBase64,
+    githubFileSyncState.hashes,
+    githubGetFile,
+    githubUpsertFile,
+    listWorkspaceTextFilesForSync,
+    persistGithubFileSyncState,
     settings.githubBranch,
     settings.githubOwner,
     settings.githubRepo,
@@ -2216,12 +2427,12 @@ function IPCoderApp() {
     settings.githubToken,
   ]);
 
-  const pullWorkspaceSnapshotFromGithub = useCallback(async () => {
+  const pullWorkspaceFilesFromGithub = useCallback(async () => {
     const owner = settings.githubOwner.trim();
     const repo = settings.githubRepo.trim();
     const branch = settings.githubBranch.trim() || "main";
     const token = settings.githubToken.trim();
-    const syncPath = settings.githubSyncPath.trim() || ".ipcoder-sync/workspace.json";
+    const syncRoot = resolveGithubSyncRootPath(settings.githubSyncPath);
 
     if (!owner || !repo || !token) {
       Alert.alert("GitHub Sync", "Set owner, repo, and token in settings.");
@@ -2230,63 +2441,89 @@ function IPCoderApp() {
 
     setGithubSyncBusy(true);
     try {
-      const pathEncoded = encodeGithubPath(syncPath);
-      const fileUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${pathEncoded}?ref=${encodeURIComponent(branch)}`;
-      const res = await fetch(fileUrl, {
-        method: "GET",
-        headers: {
-          Accept: "application/vnd.github+json",
-          Authorization: `Bearer ${token}`,
-          "X-GitHub-Api-Version": "2022-11-28",
-        },
+      const remoteFiles = await githubListFilesRecursively(owner, repo, branch, token, syncRoot);
+      const nextHashes = { ...githubFileSyncState.hashes };
+      let pulled = 0;
+      let conflicts = 0;
+
+      for (const remoteItem of remoteFiles) {
+        if (!remoteItem.path.startsWith(`${syncRoot}/`)) {
+          continue;
+        }
+        const relativePath = remoteItem.path.slice(syncRoot.length + 1);
+        if (!relativePath || relativePath.includes("..")) {
+          continue;
+        }
+
+        const remote = await githubGetFile(owner, repo, branch, token, remoteItem.path);
+        if (!remote.exists) {
+          continue;
+        }
+
+        const remoteHash = quickHash(remote.content);
+        const destination = joinFsPath(WORKSPACE_ROOT, relativePath);
+        const baseHash = githubFileSyncState.hashes[relativePath];
+        const localContent = await readFileAsTextSafe(destination);
+        const localHash = localContent === null ? undefined : quickHash(localContent);
+
+        const conflict =
+          typeof baseHash === "string" &&
+          typeof localHash === "string" &&
+          localHash !== baseHash &&
+          remoteHash !== baseHash &&
+          localHash !== remoteHash;
+
+        const folder = parentPath(destination, WORKSPACE_ROOT);
+        await FileSystem.makeDirectoryAsync(folder, { intermediates: true });
+
+        if (conflict && typeof localContent === "string") {
+          const merged = buildConflictMarkers(localContent, remote.content);
+          await FileSystem.writeAsStringAsync(destination, merged, {
+            encoding: FileSystem.EncodingType.UTF8,
+          });
+          conflicts += 1;
+          appendAppLog("error", `GitHub pull conflict markers written: ${relativePath}`);
+        } else {
+          await FileSystem.writeAsStringAsync(destination, remote.content, {
+            encoding: FileSystem.EncodingType.UTF8,
+          });
+          pulled += 1;
+        }
+
+        nextHashes[relativePath] = remoteHash;
+      }
+
+      await persistGithubFileSyncState({
+        hashes: nextHashes,
+        lastSyncAt: Date.now(),
       });
 
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`GitHub pull failed (${res.status}): ${text}`);
-      }
-
-      const payload = (await res.json()) as { content?: string; encoding?: string };
-      if (!payload.content || payload.encoding !== "base64") {
-        throw new Error("Sync file is missing base64 content.");
-      }
-
-      const decoded = await decodeBase64ToString(payload.content);
-      const snapshot = JSON.parse(decoded) as {
-        files?: Array<{ path?: unknown; content?: unknown }>;
-      };
-
-      const files = Array.isArray(snapshot.files) ? snapshot.files : [];
-      for (const item of files) {
-        if (typeof item.path !== "string" || typeof item.content !== "string") {
-          continue;
-        }
-        if (!item.path || item.path.includes("..")) {
-          continue;
-        }
-        const destination = joinFsPath(WORKSPACE_ROOT, item.path);
-        const parent = parentPath(destination, WORKSPACE_ROOT);
-        await FileSystem.makeDirectoryAsync(parent, { intermediates: true });
-        await FileSystem.writeAsStringAsync(destination, item.content, {
-          encoding: FileSystem.EncodingType.UTF8,
-        });
-      }
-
       await refreshCurrentDirectory();
-      appendAppLog("info", `GitHub pull completed (${owner}/${repo}@${branch}).`);
-      await addCommandHistory("GitHub Sync Pull");
-      Alert.alert("GitHub Sync", "Workspace snapshot pulled.");
+      appendAppLog(
+        "info",
+        `GitHub per-file pull done: ${pulled} updated, ${conflicts} conflicts.`,
+      );
+      await addCommandHistory("GitHub File Sync Pull");
+      Alert.alert(
+        "GitHub Sync",
+        `Pull complete.\nUpdated: ${pulled}\nConflicts: ${conflicts}`,
+      );
     } catch (error) {
       console.error(error);
-      appendAppLog("error", `GitHub pull error: ${String(error)}`);
-      Alert.alert("GitHub Sync", "Pull failed. Check token/repo/path permissions.");
+      appendAppLog("error", `GitHub per-file pull error: ${String(error)}`);
+      Alert.alert("GitHub Sync", "Per-file pull failed.");
     } finally {
       setGithubSyncBusy(false);
     }
   }, [
     addCommandHistory,
     appendAppLog,
-    decodeBase64ToString,
+    buildConflictMarkers,
+    githubFileSyncState.hashes,
+    githubGetFile,
+    githubListFilesRecursively,
+    persistGithubFileSyncState,
+    readFileAsTextSafe,
     refreshCurrentDirectory,
     settings.githubBranch,
     settings.githubOwner,
@@ -4275,7 +4512,7 @@ ${activeTab.content.slice(0, 18000)}`
             onChangeText={setGithubSyncPathDraft}
             autoCapitalize="none"
             autoCorrect={false}
-            placeholder=".ipcoder-sync/workspace.json"
+            placeholder=".ipcoder-sync/files"
             placeholderTextColor="#555555"
           />
           <TextInput
@@ -5489,17 +5726,17 @@ ${activeTab.content.slice(0, 18000)}`
                 : "Configure repository in Settings first."}
             </Text>
             <Text style={styles.settingHint}>
-              Sync path: {settings.githubSyncPath || ".ipcoder-sync/workspace.json"}
+              Sync root: {resolveGithubSyncRootPath(settings.githubSyncPath)}
             </Text>
             <View style={styles.modalActions}>
               <Pressable
                 style={styles.modalButtonPrimary}
                 onPress={() => {
-                  void pushWorkspaceSnapshotToGithub();
+                  void pushWorkspaceFilesToGithub();
                 }}
               >
                 <Text style={styles.modalButtonPrimaryText}>
-                  {githubSyncBusy ? "Working..." : "Push Workspace Snapshot"}
+                  {githubSyncBusy ? "Working..." : "Push Files"}
                 </Text>
               </Pressable>
             </View>
@@ -5507,11 +5744,11 @@ ${activeTab.content.slice(0, 18000)}`
               <Pressable
                 style={styles.modalButton}
                 onPress={() => {
-                  void pullWorkspaceSnapshotFromGithub();
+                  void pullWorkspaceFilesFromGithub();
                 }}
               >
                 <Text style={styles.modalButtonText}>
-                  {githubSyncBusy ? "Working..." : "Pull Workspace Snapshot"}
+                  {githubSyncBusy ? "Working..." : "Pull Files"}
                 </Text>
               </Pressable>
               <Pressable style={styles.modalButton} onPress={() => setGithubSyncVisible(false)}>
