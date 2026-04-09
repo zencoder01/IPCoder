@@ -37,7 +37,19 @@ jobs:
         run: npm run build:editor
 
       - name: Generate Android project
-        run: npx expo prebuild --platform android --non-interactive --no-install
+        run: CI=1 npx expo prebuild --platform android --no-install
+
+      - name: Patch AsyncStorage local Maven repo
+        run: |
+          REPO_LINE='    maven { url("$rootDir/../node_modules/@react-native-async-storage/async-storage/android/local_repo") }'
+          if ! grep -Fq '@react-native-async-storage/async-storage/android/local_repo' android/build.gradle; then
+            awk -v repo="${REPO_LINE}" '
+              /allprojects[[:space:]]*\{/ {in_all=1}
+              in_all && /repositories[[:space:]]*\{/ {print; print repo; next}
+              {print}
+            ' android/build.gradle > android/build.gradle.tmp
+            mv android/build.gradle.tmp android/build.gradle
+          fi
 
       - name: Build debug APK
         working-directory: android
