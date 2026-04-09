@@ -65,6 +65,7 @@ interface AppSettings {
   tabSize: number;
   fontSize: number;
   lineNumbers: boolean;
+  autoSave: boolean;
   showHiddenFiles: boolean;
   aiModel: string;
   aiApiKey: string;
@@ -212,6 +213,39 @@ interface RestorePoint {
   timestamp: number;
 }
 
+interface BookmarkEntry {
+  id: string;
+  filePath: string;
+  fileName: string;
+  line: number;
+  col: number;
+  label: string;
+  timestamp: number;
+}
+
+interface GithubSyncQueueItem {
+  id: string;
+  kind: "push" | "pull";
+  reason: string;
+  createdAt: number;
+}
+
+interface WorkspaceSnapshotPayload {
+  version: number;
+  createdAt: number;
+  settings: AppSettings;
+  recents: RecentFile[];
+  commandHistory: CommandHistoryEntry[];
+  trackerState: TrackerState;
+  pinnedFolders: string[];
+  protectedPaths: string[];
+  restorePoints: RestorePoint[];
+  bookmarks: BookmarkEntry[];
+  pinnedTabPaths: string[];
+  githubFileSyncState: GithubFileSyncState;
+  session: PersistedSession;
+}
+
 const STORAGE_SETTINGS_KEY = "ipcoder.settings.v1";
 const STORAGE_RECENTS_KEY = "ipcoder.recents.v1";
 const STORAGE_SESSION_KEY = "ipcoder.session.v1";
@@ -222,6 +256,9 @@ const STORAGE_PROTECTED_PATHS_KEY = "ipcoder.protected-paths.v1";
 const STORAGE_EXTERNAL_SAVE_DIR_KEY = "ipcoder.external-save-dir.v1";
 const STORAGE_GITHUB_FILE_SYNC_STATE_KEY = "ipcoder.github-file-sync-state.v1";
 const STORAGE_RESTORE_POINTS_KEY = "ipcoder.restore-points.v1";
+const STORAGE_BOOKMARKS_KEY = "ipcoder.bookmarks.v1";
+const STORAGE_PINNED_TABS_KEY = "ipcoder.pinned-tabs.v1";
+const STORAGE_GITHUB_SYNC_QUEUE_KEY = "ipcoder.github-sync-queue.v1";
 
 const DOCUMENT_ROOT =
   FileSystem.documentDirectory ?? FileSystem.cacheDirectory ?? "file:///tmp";
@@ -235,6 +272,9 @@ const MAX_TERMINAL_LINES = 250;
 const MAX_AI_MESSAGES = 40;
 const DRAWER_WIDTH = 280;
 const MAX_RESTORE_POINTS = 120;
+const MAX_BOOKMARKS = 200;
+const MAX_SYNC_QUEUE_ITEMS = 80;
+const AUTO_SAVE_DELAY_MS = 1800;
 
 const THEME_ORDER: EditorTheme[] = ["one-dark", "dracula", "github-light"];
 
@@ -244,6 +284,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   tabSize: 2,
   fontSize: 13,
   lineNumbers: true,
+  autoSave: false,
   showHiddenFiles: false,
   aiModel: "gpt-4.1-mini",
   aiApiKey: "",
@@ -982,6 +1023,18 @@ function IPCoderApp() {
   });
   const [historyVisible, setHistoryVisible] = useState<boolean>(false);
   const [restorePoints, setRestorePoints] = useState<RestorePoint[]>([]);
+  const [bookmarksVisible, setBookmarksVisible] = useState<boolean>(false);
+  const [bookmarks, setBookmarks] = useState<BookmarkEntry[]>([]);
+  const [pinnedTabPaths, setPinnedTabPaths] = useState<string[]>([]);
+  const [fileFilterQuery, setFileFilterQuery] = useState<string>("");
+  const [conflictVisible, setConflictVisible] = useState<boolean>(false);
+  const [conflictBusy, setConflictBusy] = useState<boolean>(false);
+  const [conflictPaths, setConflictPaths] = useState<string[]>([]);
+  const [syncQueueVisible, setSyncQueueVisible] = useState<boolean>(false);
+  const [githubSyncQueue, setGithubSyncQueue] = useState<GithubSyncQueueItem[]>([]);
+  const [snapshotVisible, setSnapshotVisible] = useState<boolean>(false);
+  const [snapshotBusy, setSnapshotBusy] = useState<boolean>(false);
+  const [workspaceSnapshots, setWorkspaceSnapshots] = useState<string[]>([]);
   const drawerTranslateX = useRef(new Animated.Value(DRAWER_WIDTH)).current;
   const drawerScrimOpacity = useRef(new Animated.Value(0)).current;
 
@@ -1003,10 +1056,21 @@ function IPCoderApp() {
     () => tabs.find((tab) => tab.id === activeTabId) ?? null,
     [tabs, activeTabId],
   );
+  const pinnedTabPathSet = useMemo(() => new Set(pinnedTabPaths), [pinnedTabPaths]);
   const unsavedPathSet = useMemo(
     () => new Set(tabs.filter((tab) => tab.content !== tab.savedContent).map((tab) => tab.path)),
     [tabs],
   );
+  const filteredEntries = useMemo(() => {
+    const query = fileFilterQuery.trim().toLowerCase();
+    if (!query) {
+      return entries;
+    }
+    return entries.filter(
+      (entry) =>
+        entry.name.toLowerCase().includes(query) || formatRelativePath(entry.path).toLowerCase().includes(query),
+    );
+  }, [entries, fileFilterQuery]);
   const diffPreviewLines = useMemo(() => {
     if (!activeTab || activeTab.content === activeTab.savedContent) {
       return [] as Array<{ type: "same" | "add" | "del"; text: string }>;
@@ -1065,6 +1129,24 @@ function IPCoderApp() {
     await AsyncStorage.setItem(STORAGE_RESTORE_POINTS_KEY, JSON.stringify(trimmed));
   }, []);
 
+  const persistBookmarks = useCallback(async (next: BookmarkEntry[]) => {
+    const trimmed = next.slice(0, MAX_BOOKMARKS);
+    setBookmarks(trimmed);
+    await AsyncStorage.setItem(STORAGE_BOOKMARKS_KEY, JSON.stringify(trimmed));
+  }, []);
+
+  const persistPinnedTabPaths = useCallback(async (next: string[]) => {
+    const deduped = Array.from(new Set(next));
+    setPinnedTabPaths(deduped);
+    await AsyncStorage.setItem(STORAGE_PINNED_TABS_KEY, JSON.stringify(deduped));
+  }, []);
+
+  const persistGithubSyncQueue = useCallback(async (next: GithubSyncQueueItem[]) => {
+    const trimmed = next.slice(0, MAX_SYNC_QUEUE_ITEMS);
+    setGithubSyncQueue(trimmed);
+    await AsyncStorage.setItem(STORAGE_GITHUB_SYNC_QUEUE_KEY, JSON.stringify(trimmed));
+  }, []);
+
   const addCommandHistory = useCallback(
     async (label: string) => {
       const next = [
@@ -1103,6 +1185,61 @@ function IPCoderApp() {
       await persistRestorePoints(next);
     },
     [persistRestorePoints, restorePoints],
+  );
+
+  const addBookmarkForActiveCursor = useCallback(async () => {
+    if (!activeTab) {
+      return;
+    }
+
+    const next: BookmarkEntry[] = [
+      {
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        filePath: activeTab.path,
+        fileName: activeTab.name,
+        line: activeTab.line,
+        col: activeTab.col,
+        label: `${activeTab.name}:${activeTab.line}`,
+        timestamp: Date.now(),
+      },
+      ...bookmarks.filter(
+        (item) =>
+          !(
+            item.filePath === activeTab.path &&
+            item.line === activeTab.line &&
+            item.col === activeTab.col
+          ),
+      ),
+    ];
+    await persistBookmarks(next);
+    appendAppLog("info", `Bookmark added ${activeTab.name}:${activeTab.line}`);
+  }, [activeTab, appendAppLog, bookmarks, persistBookmarks]);
+
+  const togglePinnedTabPath = useCallback(
+    async (path: string) => {
+      if (pinnedTabPathSet.has(path)) {
+        await persistPinnedTabPaths(pinnedTabPaths.filter((item) => item !== path));
+        return;
+      }
+      await persistPinnedTabPaths([path, ...pinnedTabPaths]);
+    },
+    [persistPinnedTabPaths, pinnedTabPathSet, pinnedTabPaths],
+  );
+
+  const enqueueGithubSync = useCallback(
+    async (kind: GithubSyncQueueItem["kind"], reason: string) => {
+      const next: GithubSyncQueueItem[] = [
+        {
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          kind,
+          reason,
+          createdAt: Date.now(),
+        },
+        ...githubSyncQueue,
+      ];
+      await persistGithubSyncQueue(next);
+    },
+    [githubSyncQueue, persistGithubSyncQueue],
   );
 
   const appendTerminalLog = useCallback((type: TerminalLogEntry["type"], text: string) => {
@@ -1501,6 +1638,9 @@ function IPCoderApp() {
           savedExternalSaveDirRaw,
           savedGithubFileSyncStateRaw,
           savedRestorePointsRaw,
+          savedBookmarksRaw,
+          savedPinnedTabsRaw,
+          savedGithubSyncQueueRaw,
         ] = await Promise.all([
           AsyncStorage.getItem(STORAGE_SETTINGS_KEY),
           AsyncStorage.getItem(STORAGE_RECENTS_KEY),
@@ -1512,6 +1652,9 @@ function IPCoderApp() {
           AsyncStorage.getItem(STORAGE_EXTERNAL_SAVE_DIR_KEY),
           AsyncStorage.getItem(STORAGE_GITHUB_FILE_SYNC_STATE_KEY),
           AsyncStorage.getItem(STORAGE_RESTORE_POINTS_KEY),
+          AsyncStorage.getItem(STORAGE_BOOKMARKS_KEY),
+          AsyncStorage.getItem(STORAGE_PINNED_TABS_KEY),
+          AsyncStorage.getItem(STORAGE_GITHUB_SYNC_QUEUE_KEY),
         ]);
 
         if (savedSettingsRaw) {
@@ -1638,6 +1781,52 @@ function IPCoderApp() {
                     typeof item.timestamp === "number",
                 )
                 .slice(0, MAX_RESTORE_POINTS),
+            );
+          }
+        }
+
+        if (savedBookmarksRaw && !cancelled) {
+          const parsed = JSON.parse(savedBookmarksRaw) as BookmarkEntry[];
+          if (Array.isArray(parsed)) {
+            setBookmarks(
+              parsed
+                .filter(
+                  (item): item is BookmarkEntry =>
+                    !!item &&
+                    typeof item.id === "string" &&
+                    typeof item.filePath === "string" &&
+                    typeof item.fileName === "string" &&
+                    typeof item.line === "number" &&
+                    typeof item.col === "number" &&
+                    typeof item.label === "string" &&
+                    typeof item.timestamp === "number",
+                )
+                .slice(0, MAX_BOOKMARKS),
+            );
+          }
+        }
+
+        if (savedPinnedTabsRaw && !cancelled) {
+          const parsed = JSON.parse(savedPinnedTabsRaw) as string[];
+          if (Array.isArray(parsed)) {
+            setPinnedTabPaths(parsed.filter((item): item is string => typeof item === "string"));
+          }
+        }
+
+        if (savedGithubSyncQueueRaw && !cancelled) {
+          const parsed = JSON.parse(savedGithubSyncQueueRaw) as GithubSyncQueueItem[];
+          if (Array.isArray(parsed)) {
+            setGithubSyncQueue(
+              parsed
+                .filter(
+                  (item): item is GithubSyncQueueItem =>
+                    !!item &&
+                    typeof item.id === "string" &&
+                    (item.kind === "push" || item.kind === "pull") &&
+                    typeof item.reason === "string" &&
+                    typeof item.createdAt === "number",
+                )
+                .slice(0, MAX_SYNC_QUEUE_ITEMS),
             );
           }
         }
@@ -1866,7 +2055,10 @@ function IPCoderApp() {
 
         if (nextTabs.length >= MAX_TABS) {
           const removableIndex = nextTabs.findIndex(
-            (tab) => tab.id !== activeTabId && tab.content === tab.savedContent,
+            (tab) =>
+              tab.id !== activeTabId &&
+              tab.content === tab.savedContent &&
+              !pinnedTabPathSet.has(tab.path),
           );
 
           if (removableIndex === -1) {
@@ -1902,7 +2094,7 @@ function IPCoderApp() {
         Alert.alert("Open Error", "Unable to open the selected file.");
       }
     },
-    [activeTabId, appendAppLog, tabs, touchRecentFile],
+    [activeTabId, appendAppLog, pinnedTabPathSet, tabs, touchRecentFile],
   );
 
   const backupFileIfNeeded = useCallback(async (path: string, content: string) => {
@@ -1922,12 +2114,15 @@ function IPCoderApp() {
     }
   }, []);
 
-  const performSaveActiveTab = useCallback(async () => {
+  const performSaveActiveTab = useCallback(
+    async (options?: { source?: "manual" | "autosave"; silent?: boolean }) => {
     if (!activeTab) {
       return;
     }
     if (readOnlyMode || isProtectedPath(activeTab.path)) {
-      Alert.alert("Read Only", "Current file is protected or read-only.");
+      if (!options?.silent) {
+        Alert.alert("Read Only", "Current file is protected or read-only.");
+      }
       return;
     }
 
@@ -1974,40 +2169,70 @@ function IPCoderApp() {
       if (!isExternal) {
         await refreshCurrentDirectory();
       }
-      await addCommandHistory(`Save ${activeTab.name}`);
-      appendAppLog("info", `Saved ${activeTab.name}`);
+      if (options?.source !== "autosave") {
+        await addCommandHistory(`Save ${activeTab.name}`);
+      }
+      appendAppLog("info", `${options?.source === "autosave" ? "Autosaved" : "Saved"} ${activeTab.name}`);
     } catch (error) {
       console.error(error);
       appendAppLog("error", `Save Error: ${String(error)}`);
-      Alert.alert("Save Error", "Unable to save the current file.");
+      if (!options?.silent) {
+        Alert.alert("Save Error", "Unable to save the current file.");
+      }
     }
-  }, [
-    activeTab,
-    addRestorePoint,
-    addCommandHistory,
-    appendAppLog,
-    backupFileIfNeeded,
-    isProtectedPath,
-    readOnlyMode,
-    refreshCurrentDirectory,
-    touchRecentFile,
-  ]);
+  },
+    [
+      activeTab,
+      addRestorePoint,
+      addCommandHistory,
+      appendAppLog,
+      backupFileIfNeeded,
+      isProtectedPath,
+      readOnlyMode,
+      refreshCurrentDirectory,
+      touchRecentFile,
+    ],
+  );
 
   const saveActiveTab = useCallback(
-    async (options?: { skipDiff?: boolean }) => {
+    async (options?: { skipDiff?: boolean; source?: "manual" | "autosave"; silent?: boolean }) => {
       if (!activeTab) {
         return;
       }
 
-      if (!options?.skipDiff && activeTab.content !== activeTab.savedContent) {
+      if (!options?.skipDiff && options?.source !== "autosave" && activeTab.content !== activeTab.savedContent) {
         setDiffVisible(true);
         return;
       }
 
-      await performSaveActiveTab();
+      await performSaveActiveTab({
+        source: options?.source ?? "manual",
+        silent: options?.silent,
+      });
     },
     [activeTab, performSaveActiveTab],
   );
+
+  useEffect(() => {
+    if (!settings.autoSave || !activeTab) {
+      return;
+    }
+    if (activeTab.content === activeTab.savedContent) {
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      void saveActiveTab({
+        skipDiff: true,
+        source: "autosave",
+        silent: true,
+      });
+    }, AUTO_SAVE_DELAY_MS);
+
+    return () => {
+      clearTimeout(timeout);
+    };
+  }, [activeTab, saveActiveTab, settings.autoSave]);
 
   const visibleRestorePoints = useMemo(() => {
     if (!activeTab) {
@@ -2016,6 +2241,14 @@ function IPCoderApp() {
     const forTab = restorePoints.filter((item) => item.filePath === activeTab.path);
     return forTab.length ? forTab : restorePoints;
   }, [activeTab, restorePoints]);
+
+  const visibleBookmarks = useMemo(() => {
+    if (!activeTab) {
+      return bookmarks;
+    }
+    const forTab = bookmarks.filter((item) => item.filePath === activeTab.path);
+    return forTab.length ? forTab : bookmarks;
+  }, [activeTab, bookmarks]);
 
   const restoreFromPoint = useCallback(
     async (point: RestorePoint) => {
@@ -2468,7 +2701,7 @@ function IPCoderApp() {
 
     if (!owner || !repo || !token) {
       Alert.alert("GitHub Sync", "Set owner, repo, and token in settings.");
-      return;
+      return false;
     }
 
     setGithubSyncBusy(true);
@@ -2538,16 +2771,20 @@ function IPCoderApp() {
         "GitHub Sync",
         `Push complete.\nUploaded: ${uploaded}\nUnchanged: ${skipped}\nConflicts: ${conflicts}`,
       );
+      return true;
     } catch (error) {
       console.error(error);
       appendAppLog("error", `GitHub per-file push error: ${String(error)}`);
+      await enqueueGithubSync("push", String(error));
       Alert.alert("GitHub Sync", "Per-file push failed.");
+      return false;
     } finally {
       setGithubSyncBusy(false);
     }
   }, [
     addCommandHistory,
     appendAppLog,
+    enqueueGithubSync,
     githubFileSyncState.hashes,
     githubGetFile,
     githubUpsertFile,
@@ -2569,7 +2806,7 @@ function IPCoderApp() {
 
     if (!owner || !repo || !token) {
       Alert.alert("GitHub Sync", "Set owner, repo, and token in settings.");
-      return;
+      return false;
     }
 
     setGithubSyncBusy(true);
@@ -2641,10 +2878,13 @@ function IPCoderApp() {
         "GitHub Sync",
         `Pull complete.\nUpdated: ${pulled}\nConflicts: ${conflicts}`,
       );
+      return true;
     } catch (error) {
       console.error(error);
       appendAppLog("error", `GitHub per-file pull error: ${String(error)}`);
+      await enqueueGithubSync("pull", String(error));
       Alert.alert("GitHub Sync", "Per-file pull failed.");
+      return false;
     } finally {
       setGithubSyncBusy(false);
     }
@@ -2652,6 +2892,7 @@ function IPCoderApp() {
     addCommandHistory,
     appendAppLog,
     buildConflictMarkers,
+    enqueueGithubSync,
     githubFileSyncState.hashes,
     githubGetFile,
     githubListFilesRecursively,
@@ -2664,6 +2905,232 @@ function IPCoderApp() {
     settings.githubSyncPath,
     settings.githubToken,
   ]);
+
+  const retryQueuedGithubSync = useCallback(
+    async (item: GithubSyncQueueItem) => {
+      const success =
+        item.kind === "push"
+          ? await pushWorkspaceFilesToGithub()
+          : await pullWorkspaceFilesFromGithub();
+      if (!success) {
+        return;
+      }
+      await persistGithubSyncQueue(githubSyncQueue.filter((queued) => queued.id !== item.id));
+      appendAppLog("info", `Queue retry success (${item.kind})`);
+    },
+    [
+      appendAppLog,
+      githubSyncQueue,
+      persistGithubSyncQueue,
+      pullWorkspaceFilesFromGithub,
+      pushWorkspaceFilesToGithub,
+    ],
+  );
+
+  const runConflictScan = useCallback(async () => {
+    setConflictBusy(true);
+    try {
+      const files = await listWorkspaceTextFilesForSync();
+      const found = files
+        .filter((file) => file.content.includes("<<<<<<< LOCAL") && file.content.includes(">>>>>>> REMOTE"))
+        .map((file) => joinFsPath(WORKSPACE_ROOT, file.relativePath));
+      setConflictPaths(found);
+      appendAppLog("info", `Conflict scan complete (${found.length} file(s)).`);
+    } catch (error) {
+      console.error(error);
+      appendAppLog("error", `Conflict scan failed: ${String(error)}`);
+      Alert.alert("Conflict Center", "Failed to scan workspace files.");
+    } finally {
+      setConflictBusy(false);
+    }
+  }, [appendAppLog, listWorkspaceTextFilesForSync]);
+
+  const listWorkspaceSnapshots = useCallback(async () => {
+    const snapshotDir = joinFsPath(WORKSPACE_ROOT, ".ipcoder/snapshots");
+    await FileSystem.makeDirectoryAsync(snapshotDir, { intermediates: true });
+    const names = await FileSystem.readDirectoryAsync(snapshotDir);
+    const mapped = names
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => joinFsPath(snapshotDir, name))
+      .sort((left, right) => right.localeCompare(left))
+      .slice(0, 40);
+    setWorkspaceSnapshots(mapped);
+  }, []);
+
+  const exportWorkspaceSnapshot = useCallback(async () => {
+    setSnapshotBusy(true);
+    try {
+      const snapshotDir = joinFsPath(WORKSPACE_ROOT, ".ipcoder/snapshots");
+      await FileSystem.makeDirectoryAsync(snapshotDir, { intermediates: true });
+      const filename = `snapshot-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+      const path = joinFsPath(snapshotDir, filename);
+      const payload: WorkspaceSnapshotPayload = {
+        version: 1,
+        createdAt: Date.now(),
+        settings,
+        recents,
+        commandHistory,
+        trackerState,
+        pinnedFolders,
+        protectedPaths,
+        restorePoints,
+        bookmarks,
+        pinnedTabPaths,
+        githubFileSyncState,
+        session: {
+          tabs: tabs.map((tab) => ({
+            id: tab.id,
+            path: tab.path,
+            name: tab.name,
+            language: tab.language,
+            content: tab.content,
+            savedContent: tab.savedContent,
+            line: tab.line,
+            col: tab.col,
+          })),
+          activeTabId,
+          currentDirectory,
+          timestamp: Date.now(),
+        },
+      };
+      await FileSystem.writeAsStringAsync(path, JSON.stringify(payload, null, 2), {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+      await listWorkspaceSnapshots();
+      appendAppLog("info", `Snapshot exported: ${filename}`);
+      Alert.alert("Snapshot", `Exported ${filename}`);
+    } catch (error) {
+      console.error(error);
+      appendAppLog("error", `Snapshot export failed: ${String(error)}`);
+      Alert.alert("Snapshot", "Failed to export workspace snapshot.");
+    } finally {
+      setSnapshotBusy(false);
+    }
+  }, [
+    activeTabId,
+    bookmarks,
+    commandHistory,
+    currentDirectory,
+    githubFileSyncState,
+    listWorkspaceSnapshots,
+    pinnedFolders,
+    pinnedTabPaths,
+    protectedPaths,
+    recents,
+    restorePoints,
+    settings,
+    tabs,
+    trackerState,
+    appendAppLog,
+  ]);
+
+  const importWorkspaceSnapshot = useCallback(
+    async (path: string) => {
+      setSnapshotBusy(true);
+      try {
+        const raw = await FileSystem.readAsStringAsync(path, {
+          encoding: FileSystem.EncodingType.UTF8,
+        });
+        const parsed = JSON.parse(raw) as Partial<WorkspaceSnapshotPayload>;
+        if (!parsed || typeof parsed !== "object" || !parsed.session) {
+          throw new Error("Invalid snapshot");
+        }
+        const session = parsed.session;
+
+        const nextSettings = { ...DEFAULT_SETTINGS, ...(parsed.settings ?? {}) };
+        await persistSettings(nextSettings);
+
+        if (Array.isArray(parsed.recents)) {
+          await persistRecents(parsed.recents.slice(0, MAX_RECENT_FILES));
+        }
+        if (Array.isArray(parsed.commandHistory)) {
+          await persistCommandHistory(parsed.commandHistory.slice(0, MAX_COMMAND_HISTORY));
+        }
+        if (parsed.trackerState && typeof parsed.trackerState === "object") {
+          await persistTrackerState(parsed.trackerState as TrackerState);
+        }
+        if (Array.isArray(parsed.pinnedFolders)) {
+          await persistPinnedFolders(parsed.pinnedFolders);
+        }
+        if (Array.isArray(parsed.protectedPaths)) {
+          await persistProtectedPaths(parsed.protectedPaths);
+        }
+        if (Array.isArray(parsed.restorePoints)) {
+          await persistRestorePoints(parsed.restorePoints as RestorePoint[]);
+        }
+        if (Array.isArray(parsed.bookmarks)) {
+          await persistBookmarks(parsed.bookmarks as BookmarkEntry[]);
+        }
+        if (Array.isArray(parsed.pinnedTabPaths)) {
+          await persistPinnedTabPaths(parsed.pinnedTabPaths.filter((item): item is string => typeof item === "string"));
+        }
+        if (parsed.githubFileSyncState && typeof parsed.githubFileSyncState === "object") {
+          await persistGithubFileSyncState(parsed.githubFileSyncState as GithubFileSyncState);
+        }
+
+        const sessionTabs = Array.isArray(session.tabs)
+          ? session.tabs
+              .map(coercePersistedTab)
+              .filter((item): item is PersistedSessionTab => item !== null)
+              .filter(
+                (item) =>
+                  pathIsWithin(item.path, WORKSPACE_ROOT) || item.path.startsWith("content://"),
+              )
+              .slice(0, MAX_TABS)
+          : [];
+        setTabs(sessionTabs);
+        setActiveTabId(
+          typeof session.activeTabId === "string"
+            ? sessionTabs.find((tab) => tab.id === session.activeTabId)?.id ?? sessionTabs[0]?.id ?? null
+            : sessionTabs[0]?.id ?? null,
+        );
+        if (
+          typeof session.currentDirectory === "string" &&
+          pathIsWithin(session.currentDirectory, WORKSPACE_ROOT)
+        ) {
+          setCurrentDirectory(session.currentDirectory);
+        }
+
+        await addCommandHistory(`Import Snapshot ${basename(path)}`);
+        appendAppLog("info", `Snapshot imported: ${basename(path)}`);
+        Alert.alert("Snapshot", "Workspace snapshot imported.");
+      } catch (error) {
+        console.error(error);
+        appendAppLog("error", `Snapshot import failed: ${String(error)}`);
+        Alert.alert("Snapshot", "Failed to import snapshot.");
+      } finally {
+        setSnapshotBusy(false);
+      }
+    },
+    [
+      addCommandHistory,
+      appendAppLog,
+      persistBookmarks,
+      persistCommandHistory,
+      persistGithubFileSyncState,
+      persistPinnedFolders,
+      persistPinnedTabPaths,
+      persistProtectedPaths,
+      persistRecents,
+      persistRestorePoints,
+      persistSettings,
+      persistTrackerState,
+    ],
+  );
+
+  useEffect(() => {
+    if (!conflictVisible) {
+      return;
+    }
+    void runConflictScan();
+  }, [conflictVisible, runConflictScan]);
+
+  useEffect(() => {
+    if (!snapshotVisible) {
+      return;
+    }
+    void listWorkspaceSnapshots();
+  }, [listWorkspaceSnapshots, snapshotVisible]);
 
   const createProjectFromTemplate = useCallback(
     async (template: ProjectTemplate) => {
@@ -3038,7 +3505,10 @@ ${activeTab.content.slice(0, 18000)}`
         let nextTabs = [...tabs];
         if (nextTabs.length >= MAX_TABS) {
           const removableIndex = nextTabs.findIndex(
-            (tab) => tab.id !== activeTabId && tab.content === tab.savedContent,
+            (tab) =>
+              tab.id !== activeTabId &&
+              tab.content === tab.savedContent &&
+              !pinnedTabPathSet.has(tab.path),
           );
           if (removableIndex === -1) {
             Alert.alert(
@@ -3074,7 +3544,7 @@ ${activeTab.content.slice(0, 18000)}`
         Alert.alert("External File", "Unable to open external file.");
       }
     },
-    [activeTabId, appendAppLog, tabs, touchRecentFile],
+    [activeTabId, appendAppLog, pinnedTabPathSet, tabs, touchRecentFile],
   );
 
   const openExternalEntry = useCallback(
@@ -3110,6 +3580,47 @@ ${activeTab.content.slice(0, 18000)}`
       await addCommandHistory(`Go To Line ${line}`);
     },
     [activeTab, addCommandHistory, sendToEditor],
+  );
+
+  const jumpToFileLocation = useCallback(
+    async (path: string, line: number, col: number) => {
+      if (path.startsWith("content://")) {
+        await openExternalFile(path);
+      } else {
+        await openFile(path);
+      }
+
+      setScreen("editor");
+      const targetLine = Math.max(1, line || 1);
+      const targetCol = Math.max(1, col || 1);
+
+      setTimeout(() => {
+        sendToEditor({
+          type: "setCursor",
+          payload: {
+            line: targetLine,
+            col: targetCol,
+          },
+        });
+      }, 140);
+    },
+    [openExternalFile, openFile, sendToEditor],
+  );
+
+  const openBookmark = useCallback(
+    async (bookmark: BookmarkEntry) => {
+      await jumpToFileLocation(bookmark.filePath, bookmark.line, bookmark.col);
+      setBookmarksVisible(false);
+      await addCommandHistory(`Bookmark ${bookmark.fileName}:${bookmark.line}`);
+    },
+    [addCommandHistory, jumpToFileLocation],
+  );
+
+  const removeBookmark = useCallback(
+    async (bookmarkId: string) => {
+      await persistBookmarks(bookmarks.filter((item) => item.id !== bookmarkId));
+    },
+    [bookmarks, persistBookmarks],
   );
 
   const quickOpenMatches = useMemo(() => {
@@ -4077,6 +4588,7 @@ ${activeTab.content.slice(0, 18000)}`
   const renderTab = (tab: EditorTab) => {
     const isActive = tab.id === activeTabId;
     const unsaved = tab.content !== tab.savedContent;
+    const pinned = pinnedTabPathSet.has(tab.path);
 
     return (
       <View
@@ -4095,8 +4607,14 @@ ${activeTab.content.slice(0, 18000)}`
               unsaved ? styles.tabTextUnsaved : null,
             ]}
           >
+            {pinned ? "[PIN] " : ""}
             {tab.name}
             {unsaved ? " *" : ""}
+          </Text>
+        </Pressable>
+        <Pressable style={styles.tabCloseButton} onPress={() => void togglePinnedTabPath(tab.path)}>
+          <Text style={[styles.tabCloseText, pinned ? styles.tabPinTextActive : styles.tabPinText]}>
+            {pinned ? "U" : "P"}
           </Text>
         </Pressable>
         <Pressable style={styles.tabCloseButton} onPress={() => closeTab(tab.id)}>
@@ -4178,6 +4696,15 @@ ${activeTab.content.slice(0, 18000)}`
         <Text style={styles.sectionLabel}>Directory Tree</Text>
         {renderBreadcrumb()}
         <Text style={styles.listHintText}>Long press files/folders for actions.</Text>
+        <TextInput
+          style={[styles.modalInput, { marginHorizontal: 12, marginBottom: 8 }]}
+          value={fileFilterQuery}
+          onChangeText={setFileFilterQuery}
+          autoCapitalize="none"
+          autoCorrect={false}
+          placeholder="Filter files in current directory"
+          placeholderTextColor="#555555"
+        />
 
         {pinnedFolders.length ? (
           <>
@@ -4248,7 +4775,7 @@ ${activeTab.content.slice(0, 18000)}`
           </Pressable>
         ) : null}
 
-        {entries.map((entry) => (
+        {filteredEntries.map((entry) => (
           <Pressable
             key={entry.path}
             style={styles.fileRow}
@@ -4281,6 +4808,9 @@ ${activeTab.content.slice(0, 18000)}`
             <Text style={styles.fileRowPath}>{formatRelativePath(entry.path)}</Text>
           </Pressable>
         ))}
+        {filteredEntries.length === 0 ? (
+          <Text style={styles.emptyText}>No files match this filter.</Text>
+        ) : null}
       </ScrollView>
     </View>
   );
@@ -4384,9 +4914,15 @@ ${activeTab.content.slice(0, 18000)}`
             void formatActiveDocument();
           })}
           {renderToolbarButton("Snippet", () => setSnippetVisible(true))}
+          {renderToolbarButton("Mark", () => {
+            void addBookmarkForActiveCursor();
+          })}
+          {renderToolbarButton("Bookmarks", () => setBookmarksVisible(true))}
           {renderToolbarButton("Cmd", () => setCommandPaletteVisible(true))}
           {renderToolbarButton("AI", () => setAiVisible(true))}
           {renderToolbarButton("Diff", () => setDiffVisible(true))}
+          {renderToolbarButton("Conflicts", () => setConflictVisible(true))}
+          {renderToolbarButton("Queue", () => setSyncQueueVisible(true), githubSyncQueue.length > 0)}
           {renderToolbarButton("Logs", () => setLogVisible(true))}
           {renderToolbarButton(`Outline ${outlineVisible ? "ON" : "OFF"}`, () =>
             setOutlineVisible((prev) => !prev),
@@ -4542,6 +5078,9 @@ ${activeTab.content.slice(0, 18000)}`
         <Pressable style={styles.settingRow} onPress={() => void toggleSetting("lineNumbers")}> 
           <Text style={styles.settingLabel}>[{settings.lineNumbers ? "X" : " "}] Line Numbers</Text>
         </Pressable>
+        <Pressable style={styles.settingRow} onPress={() => void toggleSetting("autoSave")}> 
+          <Text style={styles.settingLabel}>[{settings.autoSave ? "X" : " "}] Auto Save (debounced)</Text>
+        </Pressable>
         <Pressable
           style={styles.settingRow}
           onPress={() => void persistSettings({ ...settings, fontSize: Math.min(24, settings.fontSize + 1) })}
@@ -4681,6 +5220,18 @@ ${activeTab.content.slice(0, 18000)}`
           </Pressable>
           <Pressable style={styles.modalButton} onPress={() => setHistoryVisible(true)}>
             <Text style={styles.modalButtonText}>Restore Timeline</Text>
+          </Pressable>
+          <Pressable style={styles.modalButton} onPress={() => setBookmarksVisible(true)}>
+            <Text style={styles.modalButtonText}>Bookmarks</Text>
+          </Pressable>
+          <Pressable style={styles.modalButton} onPress={() => setConflictVisible(true)}>
+            <Text style={styles.modalButtonText}>Conflict Center</Text>
+          </Pressable>
+          <Pressable style={styles.modalButton} onPress={() => setSyncQueueVisible(true)}>
+            <Text style={styles.modalButtonText}>Sync Queue</Text>
+          </Pressable>
+          <Pressable style={styles.modalButton} onPress={() => setSnapshotVisible(true)}>
+            <Text style={styles.modalButtonText}>Snapshots</Text>
           </Pressable>
         </View>
 
@@ -4833,6 +5384,8 @@ ${activeTab.content.slice(0, 18000)}`
               <Text style={styles.drawerStatusText}>
                 External: {externalSaveDirUri ? "MOUNTED" : "NONE"}
               </Text>
+              <Text style={styles.drawerStatusText}>Bookmarks: {bookmarks.length}</Text>
+              <Text style={styles.drawerStatusText}>Sync Queue: {githubSyncQueue.length}</Text>
             </View>
 
             <ScrollView style={styles.drawerList}>
@@ -4913,6 +5466,22 @@ ${activeTab.content.slice(0, 18000)}`
               >
                 <Text style={styles.drawerButtonText}>[A] AI Assistant</Text>
               </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() =>
+                  runMenuAction(() => {
+                    void addBookmarkForActiveCursor();
+                  })
+                }
+              >
+                <Text style={styles.drawerButtonText}>[M] Add Bookmark</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => runMenuAction(() => setBookmarksVisible(true))}
+              >
+                <Text style={styles.drawerButtonText}>[K] Bookmarks</Text>
+              </Pressable>
 
               <Text style={styles.drawerSectionLabel}>File Actions</Text>
               <Pressable
@@ -4937,6 +5506,20 @@ ${activeTab.content.slice(0, 18000)}`
                 onPress={() => runMenuAction(() => setDiffVisible(true))}
               >
                 <Text style={styles.drawerButtonText}>[D] Diff Before Save</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() =>
+                  runMenuAction(() => {
+                    if (!activeTab) {
+                      Alert.alert("Tabs", "Open a file first.");
+                      return;
+                    }
+                    void togglePinnedTabPath(activeTab.path);
+                  })
+                }
+              >
+                <Text style={styles.drawerButtonText}>[I] Pin/Unpin Active Tab</Text>
               </Pressable>
 
               <Text style={styles.drawerSectionLabel}>External Storage</Text>
@@ -4971,6 +5554,24 @@ ${activeTab.content.slice(0, 18000)}`
                 onPress={() => runMenuAction(() => setHistoryVisible(true))}
               >
                 <Text style={styles.drawerButtonText}>[R] Restore Timeline</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => runMenuAction(() => setConflictVisible(true))}
+              >
+                <Text style={styles.drawerButtonText}>[O] Conflict Center</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => runMenuAction(() => setSyncQueueVisible(true))}
+              >
+                <Text style={styles.drawerButtonText}>[Q] Sync Queue</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => runMenuAction(() => setSnapshotVisible(true))}
+              >
+                <Text style={styles.drawerButtonText}>[Y] Snapshots</Text>
               </Pressable>
             </ScrollView>
           </Animated.View>
@@ -5315,12 +5916,48 @@ ${activeTab.content.slice(0, 18000)}`
               <Pressable
                 style={styles.modalButton}
                 onPress={() => {
+                  setBookmarksVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Bookmarks</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setConflictVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Conflicts</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setSyncQueueVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Sync Queue</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
                   setSaveCopyName(activeTab?.name ?? "untitled.txt");
                   setSaveCopyModalVisible(true);
                   setCommandPaletteVisible(false);
                 }}
               >
                 <Text style={styles.modalButtonText}>Save Copy</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setSnapshotVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Snapshots</Text>
               </Pressable>
             </ScrollView>
 
@@ -5916,6 +6553,217 @@ ${activeTab.content.slice(0, 18000)}`
         </View>
       </Modal>
 
+      <Modal visible={bookmarksVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>Bookmarks</Text>
+            <Text style={styles.modalPath}>
+              {activeTab ? `Active: ${activeTab.name}` : "All files"}
+            </Text>
+            <ScrollView style={[styles.modalList, styles.modalListTall]}>
+              {visibleBookmarks.length ? (
+                visibleBookmarks.map((bookmark) => (
+                  <Pressable
+                    key={bookmark.id}
+                    style={styles.modalListRow}
+                    onPress={() => {
+                      void openBookmark(bookmark);
+                    }}
+                    onLongPress={() => {
+                      Alert.alert("Remove Bookmark?", `${bookmark.label}`, [
+                        { text: "Cancel", style: "cancel" },
+                        {
+                          text: "Remove",
+                          style: "destructive",
+                          onPress: () => {
+                            void removeBookmark(bookmark.id);
+                          },
+                        },
+                      ]);
+                    }}
+                  >
+                    <Text style={styles.modalListRowTitle}>{bookmark.label}</Text>
+                    <Text style={styles.modalListRowPath}>
+                      {new Date(bookmark.timestamp).toLocaleString()}
+                    </Text>
+                    <Text style={styles.modalListRowPath}>
+                      {formatRelativePath(bookmark.filePath)}
+                    </Text>
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No bookmarks yet.</Text>
+              )}
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  void addBookmarkForActiveCursor();
+                }}
+              >
+                <Text style={styles.modalButtonText}>Add Current</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  void persistBookmarks([]);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Clear</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setBookmarksVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={conflictVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>Conflict Center</Text>
+            <Text style={styles.modalPath}>Files with LOCAL/REMOTE conflict markers.</Text>
+            <ScrollView style={[styles.modalList, styles.modalListTall]}>
+              {conflictPaths.length ? (
+                conflictPaths.map((path) => (
+                  <Pressable
+                    key={path}
+                    style={styles.modalListRow}
+                    onPress={() => {
+                      void jumpToFileLocation(path, 1, 1);
+                      setConflictVisible(false);
+                    }}
+                  >
+                    <Text style={styles.modalListRowTitle}>{basename(path)}</Text>
+                    <Text style={styles.modalListRowPath}>{formatRelativePath(path)}</Text>
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>
+                  {conflictBusy ? "Scanning..." : "No conflicts found."}
+                </Text>
+              )}
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButton} onPress={() => void runConflictScan()}>
+                <Text style={styles.modalButtonText}>{conflictBusy ? "Scanning..." : "Scan"}</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setConflictVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={syncQueueVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>GitHub Sync Queue</Text>
+            <Text style={styles.modalPath}>Failed sync operations ready for retry.</Text>
+            <ScrollView style={[styles.modalList, styles.modalListTall]}>
+              {githubSyncQueue.length ? (
+                githubSyncQueue.map((item) => (
+                  <Pressable
+                    key={item.id}
+                    style={styles.modalListRow}
+                    onPress={() => {
+                      void retryQueuedGithubSync(item);
+                    }}
+                    onLongPress={() => {
+                      void persistGithubSyncQueue(
+                        githubSyncQueue.filter((queued) => queued.id !== item.id),
+                      );
+                    }}
+                  >
+                    <Text style={styles.modalListRowTitle}>
+                      {item.kind.toUpperCase()} • {new Date(item.createdAt).toLocaleString()}
+                    </Text>
+                    <Text style={styles.modalListRowPath}>{item.reason}</Text>
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No queued sync retries.</Text>
+              )}
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  void (async () => {
+                    for (const item of [...githubSyncQueue]) {
+                      await retryQueuedGithubSync(item);
+                    }
+                  })();
+                }}
+              >
+                <Text style={styles.modalButtonText}>Retry All</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  void persistGithubSyncQueue([]);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Clear</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setSyncQueueVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={snapshotVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>Workspace Snapshots</Text>
+            <Text style={styles.modalPath}>Export/import app state to local JSON files.</Text>
+            <ScrollView style={[styles.modalList, styles.modalListTall]}>
+              {workspaceSnapshots.length ? (
+                workspaceSnapshots.map((path) => (
+                  <Pressable
+                    key={path}
+                    style={styles.modalListRow}
+                    onPress={() => {
+                      Alert.alert("Import Snapshot?", basename(path), [
+                        { text: "Cancel", style: "cancel" },
+                        {
+                          text: "Import",
+                          style: "destructive",
+                          onPress: () => {
+                            void importWorkspaceSnapshot(path);
+                          },
+                        },
+                      ]);
+                    }}
+                  >
+                    <Text style={styles.modalListRowTitle}>{basename(path)}</Text>
+                    <Text style={styles.modalListRowPath}>{formatRelativePath(path)}</Text>
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No snapshots exported yet.</Text>
+              )}
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButtonPrimary} onPress={() => void exportWorkspaceSnapshot()}>
+                <Text style={styles.modalButtonPrimaryText}>{snapshotBusy ? "Working..." : "Export"}</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => void listWorkspaceSnapshots()}>
+                <Text style={styles.modalButtonText}>Refresh</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setSnapshotVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
       <Modal visible={githubSyncVisible} transparent animationType="none">
         <View style={styles.modalBackdrop}>
           <View style={[styles.modalCard, styles.modalCardTall]}>
@@ -5931,6 +6779,7 @@ ${activeTab.content.slice(0, 18000)}`
             <Text style={styles.settingHint}>
               Last file sync: {githubFileSyncState.lastSyncAt ? new Date(githubFileSyncState.lastSyncAt).toLocaleString() : "never"}
             </Text>
+            <Text style={styles.settingHint}>Queued retries: {githubSyncQueue.length}</Text>
             <View style={styles.modalActions}>
               <Pressable
                 style={styles.modalButtonPrimary}
@@ -5953,6 +6802,9 @@ ${activeTab.content.slice(0, 18000)}`
                 <Text style={styles.modalButtonText}>
                   {githubSyncBusy ? "Working..." : "Pull Files"}
                 </Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setSyncQueueVisible(true)}>
+                <Text style={styles.modalButtonText}>Queue</Text>
               </Pressable>
               <Pressable style={styles.modalButton} onPress={() => setGithubSyncVisible(false)}>
                 <Text style={styles.modalButtonText}>Close</Text>
@@ -6297,6 +7149,12 @@ const styles = StyleSheet.create({
     color: "#FF003C",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
+  },
+  tabPinText: {
+    color: "#555555",
+  },
+  tabPinTextActive: {
+    color: "#00FF41",
   },
   editorArea: {
     flex: 1,
