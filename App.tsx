@@ -179,6 +179,15 @@ interface AiMessage {
   timestamp: number;
 }
 
+interface AiToolRequest {
+  action: string;
+  path?: string;
+  content?: string;
+  query?: string;
+  recursive?: boolean;
+  replace?: boolean;
+}
+
 interface ExternalBrowserEntry {
   uri: string;
   name: string;
@@ -269,7 +278,6 @@ const MAX_TABS = 8;
 const MAX_COMMAND_HISTORY = 30;
 const MAX_SEARCH_RESULTS = 200;
 const MAX_TERMINAL_LINES = 250;
-const MAX_AI_MESSAGES = 40;
 const DRAWER_WIDTH = 280;
 const MAX_RESTORE_POINTS = 120;
 const MAX_BOOKMARKS = 200;
@@ -861,6 +869,33 @@ const extractFirstCodeBlock = (value: string) => {
   return match[1].trim();
 };
 
+const parseAiToolRequest = (value: string): AiToolRequest | null => {
+  const toolBlockMatch = value.match(/```(?:ipcoder-tool|json)\n([\s\S]*?)```/i);
+  const candidate = (toolBlockMatch?.[1] ?? value).trim();
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start < 0 || end <= start) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(candidate.slice(start, end + 1)) as Partial<AiToolRequest>;
+    if (!parsed || typeof parsed.action !== "string") {
+      return null;
+    }
+    return {
+      action: parsed.action.trim(),
+      path: typeof parsed.path === "string" ? parsed.path : undefined,
+      content: typeof parsed.content === "string" ? parsed.content : undefined,
+      query: typeof parsed.query === "string" ? parsed.query : undefined,
+      recursive: typeof parsed.recursive === "boolean" ? parsed.recursive : undefined,
+      replace: typeof parsed.replace === "boolean" ? parsed.replace : undefined,
+    };
+  } catch {
+    return null;
+  }
+};
+
 const encodeGithubPath = (path: string) =>
   path
     .split("/")
@@ -995,6 +1030,8 @@ function IPCoderApp() {
   const [aiPrompt, setAiPrompt] = useState<string>("");
   const [aiMessages, setAiMessages] = useState<AiMessage[]>([]);
   const [aiBusy, setAiBusy] = useState<boolean>(false);
+  const [aiAgentMode, setAiAgentMode] = useState<boolean>(true);
+  const [aiConfigVisible, setAiConfigVisible] = useState<boolean>(false);
   const [aiApiKeyDraft, setAiApiKeyDraft] = useState<string>(DEFAULT_SETTINGS.aiApiKey);
   const [aiModelDraft, setAiModelDraft] = useState<string>(DEFAULT_SETTINGS.aiModel);
   const [saveCopyModalVisible, setSaveCopyModalVisible] = useState<boolean>(false);
@@ -2450,7 +2487,7 @@ function IPCoderApp() {
           content,
           timestamp: Date.now(),
         },
-      ].slice(-MAX_AI_MESSAGES),
+      ],
     );
   }, []);
 
@@ -3189,6 +3226,188 @@ function IPCoderApp() {
     ],
   );
 
+  const resolveAiPath = useCallback(
+    (inputPath?: string) => {
+      const raw = (inputPath ?? "").trim();
+      if (!raw) {
+        return currentDirectory;
+      }
+      if (raw.startsWith("content://")) {
+        return raw;
+      }
+      if (raw.startsWith("/")) {
+        return pathIsWithin(raw, WORKSPACE_ROOT) ? raw : null;
+      }
+      if (raw === "workspace") {
+        return WORKSPACE_ROOT;
+      }
+      if (raw.startsWith("workspace/")) {
+        const resolved = joinFsPath(WORKSPACE_ROOT, raw.replace(/^workspace\//, ""));
+        return pathIsWithin(resolved, WORKSPACE_ROOT) ? resolved : null;
+      }
+      const resolved = joinFsPath(currentDirectory, raw.replace(/^\.\//, ""));
+      return pathIsWithin(resolved, WORKSPACE_ROOT) ? resolved : null;
+    },
+    [currentDirectory],
+  );
+
+  const executeAiToolRequest = useCallback(
+    async (request: AiToolRequest) => {
+      const action = request.action.trim().toLowerCase();
+
+      if (action === "list_files") {
+        const targetPath = resolveAiPath(request.path);
+        if (!targetPath) {
+          return { ok: false, error: "Invalid path." };
+        }
+        if (request.recursive) {
+          const entriesInTree = await listWorkspaceFiles(targetPath);
+          return {
+            ok: true,
+            action,
+            base: formatRelativePath(targetPath),
+            entries: entriesInTree.map((entry) => ({
+              path: formatRelativePath(entry.path),
+              isDirectory: entry.isDirectory,
+              modifiedAt: entry.modifiedAt,
+            })),
+          };
+        }
+
+        const names = await FileSystem.readDirectoryAsync(targetPath);
+        const entriesInDir = await Promise.all(
+          names.map(async (name) => {
+            const entryPath = joinFsPath(targetPath, name);
+            const info = await FileSystem.getInfoAsync(entryPath);
+            return {
+              path: formatRelativePath(entryPath),
+              name,
+              isDirectory: !!info.isDirectory,
+            };
+          }),
+        );
+        return { ok: true, action, base: formatRelativePath(targetPath), entries: entriesInDir };
+      }
+
+      if (action === "read_file") {
+        const targetPath = resolveAiPath(request.path);
+        if (!targetPath) {
+          return { ok: false, error: "Invalid path." };
+        }
+        const content = targetPath.startsWith("content://")
+          ? await FileSystem.StorageAccessFramework.readAsStringAsync(targetPath, {
+              encoding: FileSystem.EncodingType.UTF8,
+            })
+          : await readFileAsTextSafe(targetPath);
+        if (typeof content !== "string") {
+          return { ok: false, error: "File is binary, unreadable, or missing." };
+        }
+        return { ok: true, action, path: formatRelativePath(targetPath), content };
+      }
+
+      if (action === "write_file") {
+        const targetPath = resolveAiPath(request.path);
+        if (!targetPath || typeof request.content !== "string") {
+          return { ok: false, error: "write_file requires path and content." };
+        }
+        if (!targetPath.startsWith("content://") && (readOnlyMode || isProtectedPath(targetPath))) {
+          return { ok: false, error: "Path is read-only or protected." };
+        }
+        if (targetPath.startsWith("content://")) {
+          await FileSystem.StorageAccessFramework.writeAsStringAsync(targetPath, request.content, {
+            encoding: FileSystem.EncodingType.UTF8,
+          });
+        } else {
+          await FileSystem.makeDirectoryAsync(parentPath(targetPath, WORKSPACE_ROOT), {
+            intermediates: true,
+          });
+          await FileSystem.writeAsStringAsync(targetPath, request.content, {
+            encoding: FileSystem.EncodingType.UTF8,
+          });
+          await refreshCurrentDirectory();
+        }
+        return { ok: true, action, path: formatRelativePath(targetPath) };
+      }
+
+      if (action === "open_file") {
+        const targetPath = resolveAiPath(request.path);
+        if (!targetPath) {
+          return { ok: false, error: "Invalid path." };
+        }
+        if (targetPath.startsWith("content://")) {
+          return { ok: false, error: "open_file currently supports workspace paths only." };
+        }
+        await openFile(targetPath);
+        return { ok: true, action, path: formatRelativePath(targetPath) };
+      }
+
+      if (action === "replace_active_file" || action === "append_active_file") {
+        if (!activeTab) {
+          return { ok: false, error: "No active file open." };
+        }
+        const incoming = request.content ?? "";
+        const next = action === "replace_active_file" ? incoming : `${activeTab.content}${incoming}`;
+        await applyActiveTabContent(
+          next,
+          action === "replace_active_file" ? "AI Agent Replace Active File" : "AI Agent Append Active File",
+        );
+        return { ok: true, action, path: formatRelativePath(activeTab.path) };
+      }
+
+      if (action === "save_active_file") {
+        await saveActiveTab({ skipDiff: true, source: "manual", silent: true });
+        return { ok: true, action, path: activeTab ? formatRelativePath(activeTab.path) : null };
+      }
+
+      if (action === "search_workspace") {
+        const query = (request.query ?? "").trim();
+        if (!query) {
+          return { ok: false, error: "search_workspace requires query." };
+        }
+        const files = await listWorkspaceFiles(WORKSPACE_ROOT);
+        const matches: Array<{ path: string; line: number; snippet: string }> = [];
+        for (const entry of files) {
+          if (entry.isDirectory) {
+            continue;
+          }
+          const content = await readFileAsTextSafe(entry.path);
+          if (typeof content !== "string") {
+            continue;
+          }
+          const lines = content.split("\n");
+          lines.forEach((lineText, idx) => {
+            if (lineText.includes(query)) {
+              matches.push({
+                path: formatRelativePath(entry.path),
+                line: idx + 1,
+                snippet: lineText.trim(),
+              });
+            }
+          });
+        }
+        return { ok: true, action, query, matches };
+      }
+
+      return {
+        ok: false,
+        error:
+          "Unknown action. Supported: list_files, read_file, write_file, open_file, replace_active_file, append_active_file, save_active_file, search_workspace",
+      };
+    },
+    [
+      activeTab,
+      applyActiveTabContent,
+      isProtectedPath,
+      listWorkspaceFiles,
+      openFile,
+      readFileAsTextSafe,
+      readOnlyMode,
+      refreshCurrentDirectory,
+      resolveAiPath,
+      saveActiveTab,
+    ],
+  );
+
   const askAi = useCallback(async () => {
     if (aiBusy) {
       return;
@@ -3211,7 +3430,7 @@ Language: ${activeTab.language}
 Cursor: Ln ${activeTab.line}, Col ${activeTab.col}
 
 File content:
-${activeTab.content.slice(0, 18000)}`
+${activeTab.content}`
       : "No file is currently open.";
 
     const userMessage = prompt;
@@ -3220,61 +3439,99 @@ ${activeTab.content.slice(0, 18000)}`
     setAiBusy(true);
 
     try {
-      const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${settings.aiApiKey.trim()}`,
+      const baseMessages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+        {
+          role: "system",
+          content:
+            "You are IPCoder AI assistant. Be concise and practical. When producing code, prefer fenced code blocks. " +
+            "When agent mode is on and you need local workspace data/actions, respond with only one fenced block using ```ipcoder-tool and raw JSON: " +
+            "{\"action\":\"read_file\",\"path\":\"workspace/README.md\"}. " +
+            "Supported actions: list_files, read_file, write_file, open_file, replace_active_file, append_active_file, save_active_file, search_workspace. " +
+            "After receiving TOOL_RESULT, either emit another ipcoder-tool JSON block or provide final user-facing answer.",
         },
-        body: JSON.stringify({
-          model,
-          temperature: 0.2,
-          messages: [
-            {
-              role: "system",
-              content:
-                "You are IPCoder AI assistant. Be concise and practical. When producing code, prefer fenced code blocks.",
-            },
-            {
-              role: "user",
-              content: `Editor context:\n${contextBlock}`,
-            },
-            ...aiMessages
-              .slice(-10)
-              .filter((message) => message.role === "user" || message.role === "assistant")
-              .map((message) => ({
-                role: message.role,
-                content: message.content,
-              })),
-            {
-              role: "user",
-              content: userMessage,
-            },
-          ],
-        }),
-      });
+        {
+          role: "user",
+          content: `Editor context:\n${contextBlock}`,
+        },
+        ...aiMessages.flatMap((message) =>
+          message.role === "user" || message.role === "assistant"
+            ? [
+                {
+                  role: message.role as "user" | "assistant",
+                  content: message.content,
+                },
+              ]
+            : [],
+        ),
+        {
+          role: "user",
+          content: userMessage,
+        },
+      ];
 
-      const payload = (await response.json()) as {
-        choices?: Array<{
-          message?: {
-            content?: unknown;
-          };
-        }>;
-        error?: { message?: string };
-      };
+      let conversation = [...baseMessages];
+      const maxSteps = aiAgentMode ? 6 : 1;
 
-      if (!response.ok) {
-        throw new Error(payload.error?.message ?? `HTTP ${response.status}`);
+      for (let step = 0; step < maxSteps; step += 1) {
+        const response = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${settings.aiApiKey.trim()}`,
+          },
+          body: JSON.stringify({
+            model,
+            temperature: 0.2,
+            messages: conversation,
+          }),
+        });
+
+        const payload = (await response.json()) as {
+          choices?: Array<{
+            message?: {
+              content?: unknown;
+            };
+          }>;
+          error?: { message?: string };
+        };
+
+        if (!response.ok) {
+          throw new Error(payload.error?.message ?? `HTTP ${response.status}`);
+        }
+
+        const content = coerceAssistantMessage(payload.choices?.[0]?.message?.content);
+        if (!content) {
+          throw new Error("Empty AI response.");
+        }
+
+        pushAiMessage("assistant", content);
+        conversation = [...conversation, { role: "assistant", content }];
+
+        if (!aiAgentMode) {
+          break;
+        }
+
+        const toolRequest = parseAiToolRequest(content);
+        if (!toolRequest) {
+          break;
+        }
+
+        const toolResult = await executeAiToolRequest(toolRequest);
+        const toolResultText = JSON.stringify(toolResult, null, 2);
+        pushAiMessage("assistant", `TOOL_RESULT\n${toolResultText}`);
+        conversation = [
+          ...conversation,
+          {
+            role: "user",
+            content:
+              `TOOL_RESULT:\n${toolResultText}\n` +
+              "If more tool work is needed, return another ```ipcoder-tool JSON block only. Otherwise provide final answer.",
+          },
+        ];
       }
 
-      const content = coerceAssistantMessage(payload.choices?.[0]?.message?.content);
-      if (!content) {
-        throw new Error("Empty AI response.");
-      }
-
-      pushAiMessage("assistant", content);
-      await addCommandHistory(`AI Ask: ${userMessage.slice(0, 48)}`);
-      appendAppLog("info", `AI response generated (${model}).`);
+      await addCommandHistory("AI Ask");
+      appendAppLog("info", `AI response generated (${model}) ${aiAgentMode ? "[agent]" : ""}.`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Request failed.";
       pushAiMessage("error", message);
@@ -3285,10 +3542,12 @@ ${activeTab.content.slice(0, 18000)}`
   }, [
     activeTab,
     addCommandHistory,
+    aiAgentMode,
     aiBusy,
     aiMessages,
     aiPrompt,
     appendAppLog,
+    executeAiToolRequest,
     pushAiMessage,
     settings.aiApiKey,
     settings.aiModel,
@@ -6872,96 +7131,131 @@ ${activeTab.content.slice(0, 18000)}`
         </View>
       </Modal>
 
-      <Modal visible={aiVisible} transparent animationType="none">
-        <View style={styles.modalBackdrop}>
-          <View style={[styles.modalCard, styles.modalCardTall]}>
-            <Text style={styles.modalTitle}>AI Assistant (Online)</Text>
-
-            <Text style={styles.modalSectionLabel}>Model</Text>
-            <TextInput
-              style={styles.modalInput}
-              value={aiModelDraft}
-              onChangeText={setAiModelDraft}
-              autoCapitalize="none"
-              autoCorrect={false}
-              placeholder="gpt-4.1-mini"
-              placeholderTextColor="#30363D"
-            />
-            <Text style={styles.modalSectionLabel}>API Key</Text>
-            <TextInput
-              style={styles.modalInput}
-              value={aiApiKeyDraft}
-              onChangeText={setAiApiKeyDraft}
-              autoCapitalize="none"
-              autoCorrect={false}
-              secureTextEntry
-              placeholder="sk-..."
-              placeholderTextColor="#30363D"
-            />
-            <View style={styles.modalActions}>
-              <Pressable style={styles.modalButton} onPress={() => void saveAiConfiguration()}>
-                <Text style={styles.modalButtonText}>Save Config</Text>
+      <Modal visible={aiVisible} animationType="slide" onRequestClose={() => setAiVisible(false)}>
+        <View
+          style={[
+            styles.aiFullScreenRoot,
+            {
+              paddingTop: insets.top,
+              paddingBottom: Math.max(insets.bottom, 8),
+            },
+          ]}
+        >
+          <View style={styles.aiFullHeader}>
+            <Pressable style={styles.headerButton} onPress={() => setAiVisible(false)}>
+              <Text style={styles.headerButtonText}>Back</Text>
+            </Pressable>
+            <Text style={styles.aiFullHeaderTitle}>IPCoder AI</Text>
+            <View style={styles.aiHeaderActions}>
+              <Pressable
+                style={styles.headerButton}
+                onPress={() => setAiAgentMode((prev) => !prev)}
+              >
+                <Text style={styles.headerButtonText}>{aiAgentMode ? "Agent ON" : "Agent OFF"}</Text>
+              </Pressable>
+              <Pressable
+                style={styles.headerButton}
+                onPress={() => setAiConfigVisible((prev) => !prev)}
+              >
+                <Text style={styles.headerButtonText}>Config</Text>
+              </Pressable>
+              <Pressable style={styles.headerButton} onPress={() => setAiMessages([])}>
+                <Text style={styles.headerButtonText}>Clear</Text>
               </Pressable>
             </View>
+          </View>
 
-            <ScrollView style={styles.aiMessagesWrap}>
-              {aiMessages.length ? (
-                aiMessages.map((message) => (
-                  <View
-                    key={message.id}
-                    style={[
-                      styles.aiMessageRow,
-                      message.role === "user"
-                        ? styles.aiMessageUser
-                        : message.role === "assistant"
-                          ? styles.aiMessageAssistant
-                          : styles.aiMessageError,
-                    ]}
-                  >
-                    <Text style={styles.aiMessageRole}>
-                      {message.role === "user" ? "YOU" : message.role === "assistant" ? "AI" : "ERR"}
-                    </Text>
-                    <Text style={styles.aiMessageText}>{message.content}</Text>
-                  </View>
-                ))
-              ) : (
-                <Text style={styles.emptyText}>No AI messages yet.</Text>
-              )}
-            </ScrollView>
+          {aiConfigVisible ? (
+            <View style={styles.aiConfigPanel}>
+              <Text style={styles.modalSectionLabel}>Model</Text>
+              <TextInput
+                style={styles.modalInput}
+                value={aiModelDraft}
+                onChangeText={setAiModelDraft}
+                autoCapitalize="none"
+                autoCorrect={false}
+                placeholder="gpt-4.1-mini"
+                placeholderTextColor="#30363D"
+              />
+              <Text style={styles.modalSectionLabel}>API Key</Text>
+              <TextInput
+                style={styles.modalInput}
+                value={aiApiKeyDraft}
+                onChangeText={setAiApiKeyDraft}
+                autoCapitalize="none"
+                autoCorrect={false}
+                secureTextEntry
+                placeholder="sk-..."
+                placeholderTextColor="#30363D"
+              />
+              <View style={styles.modalActions}>
+                <Pressable style={styles.modalButtonPrimary} onPress={() => void saveAiConfiguration()}>
+                  <Text style={styles.modalButtonPrimaryText}>Save AI Config</Text>
+                </Pressable>
+              </View>
+            </View>
+          ) : null}
 
+          <ScrollView style={styles.aiFullMessagesWrap} contentContainerStyle={styles.aiFullMessagesContent}>
+            {aiMessages.length ? (
+              aiMessages.map((message) => (
+                <View
+                  key={message.id}
+                  style={[
+                    styles.aiFullMessageBubble,
+                    message.role === "user"
+                      ? styles.aiFullMessageUser
+                      : message.role === "assistant"
+                        ? styles.aiFullMessageAssistant
+                        : styles.aiFullMessageError,
+                  ]}
+                >
+                  <Text style={styles.aiMessageRole}>
+                    {message.role === "user" ? "YOU" : message.role === "assistant" ? "AI" : "ERROR"}
+                  </Text>
+                  <Text style={styles.aiMessageText}>{message.content}</Text>
+                </View>
+              ))
+            ) : (
+              <Text style={styles.emptyText}>Start a conversation.</Text>
+            )}
+          </ScrollView>
+
+          <View style={styles.aiComposerWrap}>
             <TextInput
-              style={[styles.modalInput, styles.modalInputTopGap, styles.aiPromptInput]}
+              style={styles.aiComposerInput}
               value={aiPrompt}
               onChangeText={setAiPrompt}
               autoCapitalize="none"
               autoCorrect={false}
               multiline
-              placeholder="Ask AI about the current file..."
+              placeholder="Message IPCoder AI..."
               placeholderTextColor="#30363D"
             />
 
-            <View style={styles.modalActions}>
-              <Pressable style={styles.modalButton} onPress={() => setAiPrompt("Explain this file and suggest improvements.")}>
+            <ScrollView horizontal contentContainerStyle={styles.aiQuickActionRow}>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => setAiPrompt("Explain this code and propose a better structure.")}
+              >
                 <Text style={styles.modalButtonText}>Explain</Text>
               </Pressable>
-              <Pressable style={styles.modalButton} onPress={() => setAiPrompt("Refactor this file for readability and maintainability.")}>
-                <Text style={styles.modalButtonText}>Refactor</Text>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => setAiPrompt("Act as an agent: inspect project files and propose concrete edits.")}
+              >
+                <Text style={styles.modalButtonText}>Agent Task</Text>
               </Pressable>
-              <Pressable style={styles.modalButtonPrimary} onPress={() => void askAi()}>
-                <Text style={styles.modalButtonPrimaryText}>{aiBusy ? "Working..." : "Ask AI"}</Text>
-              </Pressable>
-            </View>
-            <View style={styles.modalActions}>
               <Pressable style={styles.modalButton} onPress={() => void applyLatestAiCode(false)}>
-                <Text style={styles.modalButtonText}>Insert Reply</Text>
+                <Text style={styles.modalButtonText}>Insert Last Reply</Text>
               </Pressable>
               <Pressable style={styles.modalButtonPrimary} onPress={() => void applyLatestAiCode(true)}>
                 <Text style={styles.modalButtonPrimaryText}>Replace File</Text>
               </Pressable>
-              <Pressable style={styles.modalButton} onPress={() => setAiVisible(false)}>
-                <Text style={styles.modalButtonText}>Close</Text>
+              <Pressable style={styles.modalButtonPrimary} onPress={() => void askAi()}>
+                <Text style={styles.modalButtonPrimaryText}>{aiBusy ? "Working..." : "Send"}</Text>
               </Pressable>
-            </View>
+            </ScrollView>
           </View>
         </View>
       </Modal>
@@ -7902,6 +8196,91 @@ const styles = StyleSheet.create({
   aiPromptInput: {
     minHeight: 80,
     textAlignVertical: "top",
+  },
+  aiFullScreenRoot: {
+    flex: 1,
+    backgroundColor: "#0D1117",
+  },
+  aiFullHeader: {
+    minHeight: 56,
+    borderBottomWidth: 1,
+    borderBottomColor: "#30363D",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingHorizontal: 12,
+  },
+  aiFullHeaderTitle: {
+    color: "#E6EDF3",
+    fontFamily: "SpaceGrotesk_700Bold",
+    fontSize: 18,
+    flex: 1,
+  },
+  aiHeaderActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  aiConfigPanel: {
+    borderBottomWidth: 1,
+    borderBottomColor: "#30363D",
+    paddingHorizontal: 12,
+    paddingBottom: 10,
+  },
+  aiFullMessagesWrap: {
+    flex: 1,
+  },
+  aiFullMessagesContent: {
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    gap: 10,
+  },
+  aiFullMessageBubble: {
+    borderWidth: 1,
+    borderColor: "#30363D",
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    maxWidth: "95%",
+  },
+  aiFullMessageUser: {
+    alignSelf: "flex-end",
+    backgroundColor: "#161B22",
+    borderColor: "#2EE6A6",
+  },
+  aiFullMessageAssistant: {
+    alignSelf: "flex-start",
+    backgroundColor: "#0D1117",
+  },
+  aiFullMessageError: {
+    alignSelf: "flex-start",
+    backgroundColor: "#2A1318",
+    borderColor: "#FF5C7C",
+  },
+  aiComposerWrap: {
+    borderTopWidth: 1,
+    borderTopColor: "#30363D",
+    paddingHorizontal: 12,
+    paddingTop: 10,
+  },
+  aiComposerInput: {
+    borderWidth: 1,
+    borderColor: "#30363D",
+    borderRadius: 12,
+    backgroundColor: "#0D1117",
+    color: "#E6EDF3",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 13,
+    minHeight: 88,
+    maxHeight: 280,
+    textAlignVertical: "top",
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+  },
+  aiQuickActionRow: {
+    alignItems: "center",
+    gap: 8,
+    paddingVertical: 10,
   },
   actionMenuList: {
     gap: 8,
