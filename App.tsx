@@ -595,7 +595,7 @@ const webviewHtml = (bundleCode: string, jetbrainsBase64: string) => {
         padding: 0;
         width: 100%;
         height: 100%;
-        background: #000000;
+        background: #0D1117;
         color: #ffffff;
       }
       body {
@@ -4653,14 +4653,86 @@ ${activeTab.content.slice(0, 18000)}`
     );
   };
 
+  const goToEditorScreen = useCallback(() => {
+    if (!tabs.length) {
+      Alert.alert("Editor", "Open a file first.");
+      return;
+    }
+    setScreen("editor");
+  }, [tabs.length]);
+
+  const renderHeaderNav = (options?: { showSave?: boolean }) => (
+    <ScrollView horizontal style={styles.headerActionsScroll} contentContainerStyle={styles.headerActions}>
+      <Pressable
+        style={[styles.headerButton, screen === "home" ? styles.headerButtonActive : null]}
+        onPress={() => setScreen("home")}
+      >
+        <Text style={styles.headerButtonText}>Files</Text>
+      </Pressable>
+      <Pressable
+        style={[styles.headerButton, screen === "editor" ? styles.headerButtonActive : null]}
+        onPress={goToEditorScreen}
+      >
+        <Text style={styles.headerButtonText}>Editor</Text>
+      </Pressable>
+      <Pressable
+        style={[styles.headerButton, screen === "settings" ? styles.headerButtonActive : null]}
+        onPress={() => setScreen("settings")}
+      >
+        <Text style={styles.headerButtonText}>Settings</Text>
+      </Pressable>
+      <Pressable
+        style={styles.headerButton}
+        onPress={() => {
+          setWorkspaceSearchVisible(true);
+        }}
+      >
+        <Text style={styles.headerButtonText}>Search</Text>
+      </Pressable>
+      <Pressable
+        style={styles.headerButton}
+        onPress={() => {
+          setCommandPaletteVisible(true);
+        }}
+      >
+        <Text style={styles.headerButtonText}>Cmd</Text>
+      </Pressable>
+      {options?.showSave ? (
+        <Pressable style={styles.headerButton} onPress={() => void saveActiveTab()}>
+          <Text style={styles.headerButtonText}>Save</Text>
+        </Pressable>
+      ) : null}
+      <Pressable style={styles.headerButton} onPress={() => openMenu()}>
+        <Text style={styles.headerButtonText}>Menu</Text>
+      </Pressable>
+    </ScrollView>
+  );
+
   const renderHomeScreen = () => (
     <View style={styles.screen}>
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>[IPCoder]</Text>
-        <Pressable style={styles.headerButton} onPress={() => openMenu()}>
-          <Text style={styles.headerButtonText}>[MENU]</Text>
-        </Pressable>
+        <Text style={styles.headerTitle}>IPCoder</Text>
+        {renderHeaderNav()}
       </View>
+
+      <ScrollView
+        horizontal
+        style={styles.homeQuickActions}
+        contentContainerStyle={styles.homeQuickActionsContent}
+      >
+        <Pressable style={styles.quickActionButton} onPress={() => setNewFileModalVisible(true)}>
+          <Text style={styles.quickActionButtonText}>New File</Text>
+        </Pressable>
+        <Pressable style={styles.quickActionButton} onPress={() => setNewFolderModalVisible(true)}>
+          <Text style={styles.quickActionButtonText}>New Folder</Text>
+        </Pressable>
+        <Pressable style={styles.quickActionButton} onPress={() => setProjectTemplateVisible(true)}>
+          <Text style={styles.quickActionButtonText}>Template</Text>
+        </Pressable>
+        <Pressable style={styles.quickActionButton} onPress={() => setBookmarksVisible(true)}>
+          <Text style={styles.quickActionButtonText}>Bookmarks</Text>
+        </Pressable>
+      </ScrollView>
 
       <ScrollView style={styles.scrollArea}>
         <Text style={styles.sectionLabel}>Recent Files</Text>
@@ -4703,7 +4775,7 @@ ${activeTab.content.slice(0, 18000)}`
           autoCapitalize="none"
           autoCorrect={false}
           placeholder="Filter files in current directory"
-          placeholderTextColor="#555555"
+          placeholderTextColor="#30363D"
         />
 
         {pinnedFolders.length ? (
@@ -4843,7 +4915,7 @@ ${activeTab.content.slice(0, 18000)}`
                 autoCapitalize="none"
                 autoCorrect={false}
                 placeholder="find"
-                placeholderTextColor="#555555"
+                placeholderTextColor="#30363D"
               />
             </View>
             <View style={styles.searchCell}>
@@ -4860,7 +4932,7 @@ ${activeTab.content.slice(0, 18000)}`
                 autoCapitalize="none"
                 autoCorrect={false}
                 placeholder="replace"
-                placeholderTextColor="#555555"
+                placeholderTextColor="#30363D"
               />
             </View>
           </View>
@@ -4941,15 +5013,8 @@ ${activeTab.content.slice(0, 18000)}`
   const renderEditorScreen = () => (
     <View style={styles.screen}>
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>[IPCoder]</Text>
-        <View style={styles.headerCompactActions}>
-          <Pressable style={styles.headerButton} onPress={() => void saveActiveTab()}>
-            <Text style={styles.headerButtonText}>[SAVE]</Text>
-          </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => openMenu()}>
-            <Text style={styles.headerButtonText}>[MENU]</Text>
-          </Pressable>
-        </View>
+        <Text style={styles.headerTitle}>{activeTab ? activeTab.name : "Editor"}</Text>
+        {renderHeaderNav({ showSave: true })}
       </View>
 
       <ScrollView horizontal style={styles.tabStrip} contentContainerStyle={styles.tabStripContent}>
@@ -5059,15 +5124,8 @@ ${activeTab.content.slice(0, 18000)}`
   const renderSettingsScreen = () => (
     <View style={styles.screen}>
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>[Settings]</Text>
-        <View style={styles.headerCompactActions}>
-          <Pressable style={styles.headerButton} onPress={() => setScreen("home")}> 
-            <Text style={styles.headerButtonText}>[FILES]</Text>
-          </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => openMenu()}>
-            <Text style={styles.headerButtonText}>[MENU]</Text>
-          </Pressable>
-        </View>
+        <Text style={styles.headerTitle}>Settings</Text>
+        {renderHeaderNav()}
       </View>
 
       <ScrollView style={styles.scrollArea}>
@@ -5110,7 +5168,7 @@ ${activeTab.content.slice(0, 18000)}`
             autoCorrect={false}
             secureTextEntry
             placeholder="OpenAI API key"
-            placeholderTextColor="#555555"
+            placeholderTextColor="#30363D"
           />
           <TextInput
             style={[styles.settingInput, styles.settingInputTopGap]}
@@ -5119,7 +5177,7 @@ ${activeTab.content.slice(0, 18000)}`
             autoCapitalize="none"
             autoCorrect={false}
             placeholder="Model (e.g. gpt-4.1-mini)"
-            placeholderTextColor="#555555"
+            placeholderTextColor="#30363D"
           />
           <View style={styles.settingActionRow}>
             <Pressable style={styles.modalButtonPrimary} onPress={() => void saveAiConfiguration()}>
@@ -5158,7 +5216,7 @@ ${activeTab.content.slice(0, 18000)}`
             autoCapitalize="none"
             autoCorrect={false}
             placeholder="Repo owner (e.g. zencoder01)"
-            placeholderTextColor="#555555"
+            placeholderTextColor="#30363D"
           />
           <TextInput
             style={[styles.settingInput, styles.settingInputTopGap]}
@@ -5167,7 +5225,7 @@ ${activeTab.content.slice(0, 18000)}`
             autoCapitalize="none"
             autoCorrect={false}
             placeholder="Repo name (e.g. IPCoder)"
-            placeholderTextColor="#555555"
+            placeholderTextColor="#30363D"
           />
           <TextInput
             style={[styles.settingInput, styles.settingInputTopGap]}
@@ -5176,7 +5234,7 @@ ${activeTab.content.slice(0, 18000)}`
             autoCapitalize="none"
             autoCorrect={false}
             placeholder="Branch (default main)"
-            placeholderTextColor="#555555"
+            placeholderTextColor="#30363D"
           />
           <TextInput
             style={[styles.settingInput, styles.settingInputTopGap]}
@@ -5185,7 +5243,7 @@ ${activeTab.content.slice(0, 18000)}`
             autoCapitalize="none"
             autoCorrect={false}
             placeholder=".ipcoder-sync/files"
-            placeholderTextColor="#555555"
+            placeholderTextColor="#30363D"
           />
           <TextInput
             style={[styles.settingInput, styles.settingInputTopGap]}
@@ -5195,7 +5253,7 @@ ${activeTab.content.slice(0, 18000)}`
             autoCorrect={false}
             secureTextEntry
             placeholder="GitHub token (repo contents write)"
-            placeholderTextColor="#555555"
+            placeholderTextColor="#30363D"
           />
           <View style={styles.settingActionRow}>
             <Pressable style={styles.modalButtonPrimary} onPress={() => void saveGithubConfiguration()}>
@@ -5339,7 +5397,7 @@ ${activeTab.content.slice(0, 18000)}`
           },
         ]}
       >
-        <StatusBar barStyle="light-content" backgroundColor="#000000" translucent={false} />
+        <StatusBar barStyle="light-content" backgroundColor="#0D1117" translucent={false} />
         <View style={styles.loadingWrap}>
           <Text style={styles.loadingText}>{loadingState || "Loading local assets..."}</Text>
         </View>
@@ -5357,7 +5415,7 @@ ${activeTab.content.slice(0, 18000)}`
         },
       ]}
     >
-      <StatusBar barStyle="light-content" backgroundColor="#000000" translucent={false} />
+      <StatusBar barStyle="light-content" backgroundColor="#0D1117" translucent={false} />
 
       {screen === "home" ? renderHomeScreen() : null}
       {screen === "editor" ? renderEditorScreen() : null}
@@ -5795,7 +5853,7 @@ ${activeTab.content.slice(0, 18000)}`
               autoCapitalize="none"
               autoCorrect={false}
               placeholder="Search commands or files"
-              placeholderTextColor="#555555"
+              placeholderTextColor="#30363D"
             />
 
             <View style={styles.inlineInputRow}>
@@ -5805,7 +5863,7 @@ ${activeTab.content.slice(0, 18000)}`
                 onChangeText={setGoToLineValue}
                 keyboardType="number-pad"
                 placeholder="Go to line"
-                placeholderTextColor="#555555"
+                placeholderTextColor="#30363D"
               />
               <Pressable
                 style={styles.modalButtonPrimary}
@@ -6035,7 +6093,7 @@ ${activeTab.content.slice(0, 18000)}`
               autoCapitalize="none"
               autoCorrect={false}
               placeholder="Search text"
-              placeholderTextColor="#555555"
+              placeholderTextColor="#30363D"
             />
             <TextInput
               style={[styles.modalInput, styles.modalInputTopGap]}
@@ -6044,7 +6102,7 @@ ${activeTab.content.slice(0, 18000)}`
               autoCapitalize="none"
               autoCorrect={false}
               placeholder="Replace with"
-              placeholderTextColor="#555555"
+              placeholderTextColor="#30363D"
             />
 
             <View style={styles.modalActions}>
@@ -6142,7 +6200,7 @@ ${activeTab.content.slice(0, 18000)}`
               autoCapitalize="none"
               autoCorrect={false}
               placeholder="Commit message"
-              placeholderTextColor="#555555"
+              placeholderTextColor="#30363D"
             />
             <View style={styles.modalActions}>
               <Pressable style={styles.modalButtonPrimary} onPress={() => void commitTracker()}>
@@ -6207,7 +6265,7 @@ ${activeTab.content.slice(0, 18000)}`
                   void runTerminalCommand();
                 }}
                 placeholder="type command (help)"
-                placeholderTextColor="#555555"
+                placeholderTextColor="#30363D"
               />
               <Pressable style={styles.modalButtonPrimary} onPress={() => void runTerminalCommand()}>
                 <Text style={styles.modalButtonPrimaryText}>Run</Text>
@@ -6298,7 +6356,7 @@ ${activeTab.content.slice(0, 18000)}`
               autoCapitalize="none"
               autoCorrect={false}
               placeholder="File name for copy"
-              placeholderTextColor="#555555"
+              placeholderTextColor="#30363D"
             />
             <View style={styles.modalActions}>
               <Pressable style={styles.modalButton} onPress={() => setSaveCopyModalVisible(false)}>
@@ -6384,7 +6442,7 @@ ${activeTab.content.slice(0, 18000)}`
               autoCapitalize="none"
               autoCorrect={false}
               placeholder="Project folder name"
-              placeholderTextColor="#555555"
+              placeholderTextColor="#30363D"
             />
             <ScrollView style={[styles.modalList, styles.modalListTall]}>
               {PROJECT_TEMPLATES.map((template) => (
@@ -6827,7 +6885,7 @@ ${activeTab.content.slice(0, 18000)}`
               autoCapitalize="none"
               autoCorrect={false}
               placeholder="gpt-4.1-mini"
-              placeholderTextColor="#555555"
+              placeholderTextColor="#30363D"
             />
             <Text style={styles.modalSectionLabel}>API Key</Text>
             <TextInput
@@ -6838,7 +6896,7 @@ ${activeTab.content.slice(0, 18000)}`
               autoCorrect={false}
               secureTextEntry
               placeholder="sk-..."
-              placeholderTextColor="#555555"
+              placeholderTextColor="#30363D"
             />
             <View style={styles.modalActions}>
               <Pressable style={styles.modalButton} onPress={() => void saveAiConfiguration()}>
@@ -6879,7 +6937,7 @@ ${activeTab.content.slice(0, 18000)}`
               autoCorrect={false}
               multiline
               placeholder="Ask AI about the current file..."
-              placeholderTextColor="#555555"
+              placeholderTextColor="#30363D"
             />
 
             <View style={styles.modalActions}>
@@ -6922,25 +6980,26 @@ export default function App() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
   },
   screen: {
     flex: 1,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
   },
   header: {
     minHeight: 56,
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 12,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
   },
   headerTitle: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontSize: 18,
     fontFamily: "SpaceGrotesk_700Bold",
+    maxWidth: 180,
   },
   headerActions: {
     flexDirection: "row",
@@ -6949,6 +7008,7 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
     paddingLeft: 6,
     paddingRight: 2,
+    paddingBottom: 8,
   },
   headerActionsScroll: {
     flex: 1,
@@ -6963,11 +7023,40 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 6,
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
+    borderRadius: 10,
+  },
+  headerButtonActive: {
+    borderColor: "#2EE6A6",
+    backgroundColor: "#161B22",
   },
   headerButtonText: {
-    color: "#00FF41",
+    color: "#2EE6A6",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 12,
+  },
+  homeQuickActions: {
+    borderBottomWidth: 1,
+    borderBottomColor: "#30363D",
+    backgroundColor: "#0D1117",
+  },
+  homeQuickActionsContent: {
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    gap: 8,
+  },
+  quickActionButton: {
+    borderWidth: 1,
+    borderColor: "#30363D",
+    backgroundColor: "#161B22",
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  quickActionButtonText: {
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
@@ -6975,7 +7064,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   sectionLabel: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "SpaceGrotesk_700Bold",
     fontSize: 14,
     marginTop: 16,
@@ -6983,7 +7072,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
   },
   emptyText: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "SpaceGrotesk_400Regular",
     fontSize: 13,
     paddingHorizontal: 12,
@@ -6992,7 +7081,7 @@ const styles = StyleSheet.create({
   breadcrumbWrap: {
     borderTopWidth: 1,
     borderBottomWidth: 1,
-    borderColor: "#555555",
+    borderColor: "#30363D",
     minHeight: 40,
   },
   breadcrumbNode: {
@@ -7002,43 +7091,47 @@ const styles = StyleSheet.create({
     paddingHorizontal: 6,
   },
   breadcrumbText: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   breadcrumbDivider: {
-    color: "#555555",
+    color: "#30363D",
     marginLeft: 8,
     fontFamily: "JetBrainsMono_500Medium",
   },
   fileRow: {
     minHeight: 48,
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 12,
     justifyContent: "center",
+    borderRadius: 8,
+    marginHorizontal: 8,
+    marginBottom: 6,
+    borderWidth: 1,
   },
   fileRowName: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "SpaceGrotesk_400Regular",
     fontSize: 14,
   },
   fileRowDirectory: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 13,
   },
   fileRowPath: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginTop: 2,
   },
   fileRowDraft: {
-    color: "#FF003C",
+    color: "#FF5C7C",
   },
   listHintText: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     paddingHorizontal: 12,
@@ -7046,56 +7139,60 @@ const styles = StyleSheet.create({
   },
   bulkBar: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 12,
     paddingVertical: 8,
     gap: 8,
   },
   bulkBarText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   bulkButton: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
+    borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 8,
     alignItems: "center",
   },
   bulkButtonText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   bulkButtonDanger: {
     borderWidth: 1,
-    borderColor: "#FF003C",
-    backgroundColor: "#000000",
+    borderColor: "#FF5C7C",
+    backgroundColor: "#0D1117",
+    borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 8,
     alignItems: "center",
   },
   bulkButtonDangerText: {
-    color: "#FF003C",
+    color: "#FF5C7C",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   selectionToggle: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 12,
     paddingVertical: 10,
+    marginHorizontal: 8,
+    borderRadius: 10,
   },
   selectionToggleText: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   tabStrip: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     minHeight: 42,
     maxHeight: 42,
   },
@@ -7106,19 +7203,22 @@ const styles = StyleSheet.create({
     minWidth: 120,
     maxWidth: 220,
     borderRightWidth: 1,
-    borderRightColor: "#555555",
+    borderRightColor: "#30363D",
     borderTopWidth: 2,
     borderTopColor: "transparent",
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
     flexDirection: "row",
     alignItems: "center",
+    borderTopLeftRadius: 8,
+    borderTopRightRadius: 8,
+    marginRight: 4,
   },
   tabItemActive: {
-    borderTopColor: "#00FF41",
-    backgroundColor: "#111111",
+    borderTopColor: "#2EE6A6",
+    backgroundColor: "#161B22",
   },
   tabItemUnsaved: {
-    borderTopColor: "#FF003C",
+    borderTopColor: "#FF5C7C",
   },
   tabLabelWrap: {
     flex: 1,
@@ -7127,34 +7227,34 @@ const styles = StyleSheet.create({
     minHeight: 40,
   },
   tabText: {
-    color: "#AAAAAA",
+    color: "#9BA7B4",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
   },
   tabTextActive: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
   },
   tabTextUnsaved: {
-    color: "#FF003C",
+    color: "#FF5C7C",
   },
   tabCloseButton: {
     width: 28,
     minHeight: 40,
     borderLeftWidth: 1,
-    borderLeftColor: "#555555",
+    borderLeftColor: "#30363D",
     alignItems: "center",
     justifyContent: "center",
   },
   tabCloseText: {
-    color: "#FF003C",
+    color: "#FF5C7C",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   tabPinText: {
-    color: "#555555",
+    color: "#30363D",
   },
   tabPinTextActive: {
-    color: "#00FF41",
+    color: "#2EE6A6",
   },
   editorArea: {
     flex: 1,
@@ -7170,20 +7270,20 @@ const styles = StyleSheet.create({
   },
   webview: {
     flex: 1,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
   },
   miniMapWrap: {
     width: 84,
     borderLeftWidth: 1,
-    borderLeftColor: "#555555",
-    backgroundColor: "#000000",
+    borderLeftColor: "#30363D",
+    backgroundColor: "#0D1117",
   },
   miniMapTitle: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 10,
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 6,
     paddingVertical: 4,
   },
@@ -7193,7 +7293,7 @@ const styles = StyleSheet.create({
     paddingTop: 4,
   },
   miniMapLine: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 8,
     lineHeight: 10,
@@ -7205,25 +7305,25 @@ const styles = StyleSheet.create({
     width: 220,
     maxHeight: 260,
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
   },
   outlineHeader: {
     minHeight: 30,
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
     paddingHorizontal: 8,
   },
   outlineTitle: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 11,
   },
   outlineCloseText: {
-    color: "#FF003C",
+    color: "#FF5C7C",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 11,
   },
@@ -7232,17 +7332,17 @@ const styles = StyleSheet.create({
   },
   outlineRow: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 6,
   },
   outlineRowText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
   },
   outlineEmpty: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     paddingHorizontal: 8,
@@ -7251,8 +7351,8 @@ const styles = StyleSheet.create({
   toolbarWrap: {
     minHeight: 46,
     borderTopWidth: 1,
-    borderTopColor: "#555555",
-    backgroundColor: "#000000",
+    borderTopColor: "#30363D",
+    backgroundColor: "#0D1117",
   },
   toolbarContent: {
     alignItems: "center",
@@ -7261,28 +7361,29 @@ const styles = StyleSheet.create({
   },
   toolbarButton: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
+    borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 6,
     marginVertical: 6,
   },
   toolbarButtonActive: {
-    borderColor: "#00FF41",
-    backgroundColor: "#111111",
+    borderColor: "#2EE6A6",
+    backgroundColor: "#161B22",
   },
   toolbarButtonText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   toolbarButtonTextActive: {
-    color: "#00FF41",
+    color: "#2EE6A6",
   },
   searchPalette: {
     borderTopWidth: 1,
-    borderTopColor: "#555555",
-    backgroundColor: "#000000",
+    borderTopColor: "#30363D",
+    backgroundColor: "#0D1117",
     paddingTop: 8,
     paddingBottom: 6,
     paddingHorizontal: 8,
@@ -7295,20 +7396,21 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   searchLabel: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 11,
     marginBottom: 4,
   },
   searchInput: {
     borderWidth: 1,
-    borderColor: "#555555",
-    color: "#FFFFFF",
+    borderColor: "#30363D",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
     paddingHorizontal: 8,
     paddingVertical: 6,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
+    borderRadius: 10,
   },
   searchOptions: {
     marginTop: 8,
@@ -7321,53 +7423,55 @@ const styles = StyleSheet.create({
   statusBarWrap: {
     height: 24,
     borderTopWidth: 1,
-    borderTopColor: "#555555",
+    borderTopColor: "#30363D",
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
     paddingHorizontal: 8,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
   },
   statusBarText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
   },
   settingRow: {
     minHeight: 48,
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     justifyContent: "center",
     paddingHorizontal: 12,
   },
   settingLabel: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 13,
   },
   settingBlock: {
     borderWidth: 1,
-    borderColor: "#555555",
+    borderColor: "#30363D",
     marginHorizontal: 12,
     marginBottom: 10,
     padding: 10,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
+    borderRadius: 12,
   },
   settingHint: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginBottom: 8,
   },
   settingInput: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
-    color: "#FFFFFF",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
     paddingHorizontal: 8,
     paddingVertical: 8,
+    borderRadius: 10,
   },
   settingInputTopGap: {
     marginTop: 8,
@@ -7386,39 +7490,40 @@ const styles = StyleSheet.create({
     flexWrap: "wrap",
   },
   settingValue: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
   },
   pluginCard: {
     borderWidth: 1,
-    borderColor: "#555555",
+    borderColor: "#30363D",
     marginHorizontal: 12,
     marginBottom: 10,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
     padding: 8,
     gap: 6,
+    borderRadius: 12,
   },
   pluginTitle: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "SpaceGrotesk_700Bold",
     fontSize: 13,
   },
   pluginCommandButton: {
     borderWidth: 1,
-    borderColor: "#555555",
+    borderColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 7,
   },
   pluginCommandText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
   },
   resetButton: {
     borderWidth: 1,
-    borderColor: "#FF003C",
-    backgroundColor: "#000000",
+    borderColor: "#FF5C7C",
+    backgroundColor: "#0D1117",
     marginHorizontal: 12,
     marginTop: 20,
     marginBottom: 24,
@@ -7426,7 +7531,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   resetButtonText: {
-    color: "#FF003C",
+    color: "#FF5C7C",
     fontFamily: "SpaceGrotesk_700Bold",
     fontSize: 13,
   },
@@ -7437,7 +7542,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
   },
   loadingText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 13,
     textAlign: "center",
@@ -7457,7 +7562,7 @@ const styles = StyleSheet.create({
   },
   drawerScrim: {
     flex: 1,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
   },
   drawerScrimTouch: {
     flex: 1,
@@ -7465,11 +7570,13 @@ const styles = StyleSheet.create({
   drawerPanel: {
     width: DRAWER_WIDTH,
     borderLeftWidth: 1,
-    borderLeftColor: "#555555",
-    backgroundColor: "#000000",
+    borderLeftColor: "#30363D",
+    backgroundColor: "#0D1117",
     paddingTop: 16,
     paddingBottom: 16,
     paddingHorizontal: 10,
+    borderTopLeftRadius: 14,
+    borderBottomLeftRadius: 14,
   },
   drawerHeaderRow: {
     flexDirection: "row",
@@ -7478,40 +7585,40 @@ const styles = StyleSheet.create({
     marginBottom: 10,
   },
   drawerTitle: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "SpaceGrotesk_700Bold",
     fontSize: 16,
   },
   drawerCloseButton: {
     borderWidth: 1,
-    borderColor: "#555555",
+    borderColor: "#30363D",
     width: 30,
     height: 30,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
   },
   drawerCloseText: {
-    color: "#FF003C",
+    color: "#FF5C7C",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   drawerStatusCard: {
     borderWidth: 1,
-    borderColor: "#555555",
+    borderColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 8,
     marginBottom: 10,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
   },
   drawerStatusText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginBottom: 2,
   },
   drawerSectionLabel: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 11,
     marginBottom: 6,
@@ -7522,14 +7629,15 @@ const styles = StyleSheet.create({
   },
   drawerButton: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
+    borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 10,
     marginBottom: 8,
   },
   drawerButtonText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
@@ -7541,34 +7649,36 @@ const styles = StyleSheet.create({
   },
   modalCard: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
     padding: 12,
+    borderRadius: 14,
   },
   modalCardTall: {
     maxHeight: "92%",
   },
   modalTitle: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "SpaceGrotesk_700Bold",
     fontSize: 16,
     marginBottom: 4,
   },
   modalPath: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
     marginBottom: 10,
   },
   modalInput: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
-    color: "#FFFFFF",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 13,
     paddingHorizontal: 8,
     paddingVertical: 8,
+    borderRadius: 10,
   },
   modalInputTopGap: {
     marginTop: 8,
@@ -7591,7 +7701,7 @@ const styles = StyleSheet.create({
     paddingBottom: 2,
   },
   modalSectionLabel: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 11,
     marginTop: 10,
@@ -7600,35 +7710,35 @@ const styles = StyleSheet.create({
   modalList: {
     maxHeight: 140,
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
   },
   modalListTall: {
     maxHeight: 360,
   },
   modalListRow: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 8,
   },
   modalListRowTitle: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   modalListRowPath: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginTop: 2,
   },
   historyRowText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 8,
   },
@@ -7640,17 +7750,17 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
   },
   diffLineSame: {
-    color: "#AAAAAA",
+    color: "#9BA7B4",
   },
   diffLineAdd: {
-    color: "#00FF41",
+    color: "#2EE6A6",
   },
   diffLineDel: {
-    color: "#FF003C",
+    color: "#FF5C7C",
   },
   logRow: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 8,
   },
@@ -7660,19 +7770,19 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   logLevelInfo: {
-    color: "#00FF41",
+    color: "#2EE6A6",
   },
   logLevelError: {
-    color: "#FF003C",
+    color: "#FF5C7C",
   },
   logText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     lineHeight: 16,
   },
   searchBusyText: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
     marginTop: 8,
@@ -7680,111 +7790,111 @@ const styles = StyleSheet.create({
   },
   searchResultRow: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 8,
   },
   searchResultTitle: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   searchResultPath: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginTop: 2,
   },
   searchResultSnippet: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginTop: 4,
   },
   trackerRow: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 8,
   },
   trackerRowTitle: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   trackerRowPath: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginTop: 2,
   },
   commitRow: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 8,
   },
   commitRowTitle: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   commitRowMeta: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginTop: 2,
   },
   terminalLogWrap: {
     borderWidth: 1,
-    borderColor: "#555555",
+    borderColor: "#30363D",
     maxHeight: 260,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
     marginTop: 6,
   },
   terminalLine: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
     paddingHorizontal: 8,
     paddingVertical: 4,
   },
   terminalLineError: {
-    color: "#FF003C",
+    color: "#FF5C7C",
   },
   terminalLineInput: {
-    color: "#00FF41",
+    color: "#2EE6A6",
   },
   aiMessagesWrap: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
     marginTop: 8,
     maxHeight: 240,
   },
   aiMessageRow: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 8,
   },
   aiMessageUser: {
-    backgroundColor: "#111111",
+    backgroundColor: "#161B22",
   },
   aiMessageAssistant: {
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
   },
   aiMessageError: {
     backgroundColor: "#1A0000",
   },
   aiMessageRole: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 10,
     marginBottom: 4,
   },
   aiMessageText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
     lineHeight: 18,
@@ -7798,21 +7908,21 @@ const styles = StyleSheet.create({
   },
   actionMenuButton: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
     paddingHorizontal: 10,
     paddingVertical: 10,
   },
   actionMenuButtonText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   actionMenuButtonDanger: {
-    borderColor: "#FF003C",
+    borderColor: "#FF5C7C",
   },
   actionMenuButtonDangerText: {
-    color: "#FF003C",
+    color: "#FF5C7C",
   },
   modalActions: {
     flexDirection: "row",
@@ -7822,25 +7932,27 @@ const styles = StyleSheet.create({
   },
   modalButton: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
+    borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 8,
   },
   modalButtonText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   modalButtonPrimary: {
     borderWidth: 1,
-    borderColor: "#00FF41",
-    backgroundColor: "#111111",
+    borderColor: "#2EE6A6",
+    backgroundColor: "#161B22",
+    borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 8,
   },
   modalButtonPrimaryText: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
