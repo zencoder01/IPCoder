@@ -20,10 +20,13 @@ Offline-first mobile code editor for Android built with React Native (Expo) and 
 - Multi-select mode with bulk move/delete
 - Animated hamburger sidebar menu with grouped sections for primary actions
 - Multi-tab editor (max 8 tabs) with unsaved `*` indicator
+- Optional debounced autosave mode for active file
+- Tab pin/unpin controls to protect important tabs from auto-eviction
 - Toolbar actions: Undo, Redo, Search, Word Wrap, Indent, Comment, Theme toggle, Format, Snippets, Command Palette, Outline, MiniMap
 - Inline Search Palette with search/replace + case/regex/whole-word toggles
 - Command Palette with quick-open, go-to-line, plugin command launcher, and command history
 - Workspace search + replace across files
+- Directory file filter input for fast narrowing in current folder
 - Local tracker (init, stage, commit log)
 - Built-in terminal panel (`help`, `pwd`, `ls`, `cat`, `touch`, `mkdir`, `rm`, `mv`, `echo`)
 - Snippet library + plugin-provided insert snippets
@@ -32,7 +35,12 @@ Offline-first mobile code editor for Android built with React Native (Expo) and 
 - Online AI assistant panel (OpenAI API key + model, prompt history, apply AI output to editor)
 - Save Copy flow to Android local storage / SD card folders via SAF directory permissions
 - External folder mount card + SAF external folder browser modal
-- GitHub sync panel (push/pull workspace snapshots via GitHub Contents API)
+- GitHub sync panel (per-file push/pull via GitHub Contents API with conflict markers)
+- Conflict Center scanner for LOCAL/REMOTE merge markers
+- GitHub sync retry queue for failed push/pull operations
+- Restore Timeline with pre-save snapshots and one-tap restore
+- File bookmarks (line/column) with quick jump
+- Workspace snapshots (export/import local JSON app state)
 - Project templates (React Web, Node CLI, Python Tool, C++ CMake)
 - Diff-before-save modal with line-level preview
 - In-app log console for app/file/sync diagnostics

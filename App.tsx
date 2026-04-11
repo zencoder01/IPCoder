@@ -65,6 +65,7 @@ interface AppSettings {
   tabSize: number;
   fontSize: number;
   lineNumbers: boolean;
+  autoSave: boolean;
   showHiddenFiles: boolean;
   aiModel: string;
   aiApiKey: string;
@@ -178,6 +179,15 @@ interface AiMessage {
   timestamp: number;
 }
 
+interface AiToolRequest {
+  action: string;
+  path?: string;
+  content?: string;
+  query?: string;
+  recursive?: boolean;
+  replace?: boolean;
+}
+
 interface ExternalBrowserEntry {
   uri: string;
   name: string;
@@ -198,6 +208,53 @@ interface ProjectTemplate {
   files: Record<string, string>;
 }
 
+interface GithubFileSyncState {
+  hashes: Record<string, string>;
+  lastSyncAt: number;
+}
+
+interface RestorePoint {
+  id: string;
+  filePath: string;
+  fileName: string;
+  content: string;
+  label: string;
+  timestamp: number;
+}
+
+interface BookmarkEntry {
+  id: string;
+  filePath: string;
+  fileName: string;
+  line: number;
+  col: number;
+  label: string;
+  timestamp: number;
+}
+
+interface GithubSyncQueueItem {
+  id: string;
+  kind: "push" | "pull";
+  reason: string;
+  createdAt: number;
+}
+
+interface WorkspaceSnapshotPayload {
+  version: number;
+  createdAt: number;
+  settings: AppSettings;
+  recents: RecentFile[];
+  commandHistory: CommandHistoryEntry[];
+  trackerState: TrackerState;
+  pinnedFolders: string[];
+  protectedPaths: string[];
+  restorePoints: RestorePoint[];
+  bookmarks: BookmarkEntry[];
+  pinnedTabPaths: string[];
+  githubFileSyncState: GithubFileSyncState;
+  session: PersistedSession;
+}
+
 const STORAGE_SETTINGS_KEY = "ipcoder.settings.v1";
 const STORAGE_RECENTS_KEY = "ipcoder.recents.v1";
 const STORAGE_SESSION_KEY = "ipcoder.session.v1";
@@ -206,6 +263,11 @@ const STORAGE_TRACKER_KEY = "ipcoder.tracker.v1";
 const STORAGE_PINNED_FOLDERS_KEY = "ipcoder.pinned-folders.v1";
 const STORAGE_PROTECTED_PATHS_KEY = "ipcoder.protected-paths.v1";
 const STORAGE_EXTERNAL_SAVE_DIR_KEY = "ipcoder.external-save-dir.v1";
+const STORAGE_GITHUB_FILE_SYNC_STATE_KEY = "ipcoder.github-file-sync-state.v1";
+const STORAGE_RESTORE_POINTS_KEY = "ipcoder.restore-points.v1";
+const STORAGE_BOOKMARKS_KEY = "ipcoder.bookmarks.v1";
+const STORAGE_PINNED_TABS_KEY = "ipcoder.pinned-tabs.v1";
+const STORAGE_GITHUB_SYNC_QUEUE_KEY = "ipcoder.github-sync-queue.v1";
 
 const DOCUMENT_ROOT =
   FileSystem.documentDirectory ?? FileSystem.cacheDirectory ?? "file:///tmp";
@@ -216,8 +278,11 @@ const MAX_TABS = 8;
 const MAX_COMMAND_HISTORY = 30;
 const MAX_SEARCH_RESULTS = 200;
 const MAX_TERMINAL_LINES = 250;
-const MAX_AI_MESSAGES = 40;
 const DRAWER_WIDTH = 280;
+const MAX_RESTORE_POINTS = 120;
+const MAX_BOOKMARKS = 200;
+const MAX_SYNC_QUEUE_ITEMS = 80;
+const AUTO_SAVE_DELAY_MS = 1800;
 
 const THEME_ORDER: EditorTheme[] = ["one-dark", "dracula", "github-light"];
 
@@ -227,6 +292,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   tabSize: 2,
   fontSize: 13,
   lineNumbers: true,
+  autoSave: false,
   showHiddenFiles: false,
   aiModel: "gpt-4.1-mini",
   aiApiKey: "",
@@ -234,7 +300,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   githubRepo: "",
   githubBranch: "main",
   githubToken: "",
-  githubSyncPath: ".ipcoder-sync/workspace.json",
+  githubSyncPath: ".ipcoder-sync/files",
 };
 
 const PROJECT_TEMPLATES: ProjectTemplate[] = [
@@ -537,7 +603,7 @@ const webviewHtml = (bundleCode: string, jetbrainsBase64: string) => {
         padding: 0;
         width: 100%;
         height: 100%;
-        background: #000000;
+        background: #0D1117;
         color: #ffffff;
       }
       body {
@@ -803,12 +869,50 @@ const extractFirstCodeBlock = (value: string) => {
   return match[1].trim();
 };
 
+const parseAiToolRequest = (value: string): AiToolRequest | null => {
+  const toolBlockMatch = value.match(/```(?:ipcoder-tool|json)\n([\s\S]*?)```/i);
+  const candidate = (toolBlockMatch?.[1] ?? value).trim();
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start < 0 || end <= start) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(candidate.slice(start, end + 1)) as Partial<AiToolRequest>;
+    if (!parsed || typeof parsed.action !== "string") {
+      return null;
+    }
+    return {
+      action: parsed.action.trim(),
+      path: typeof parsed.path === "string" ? parsed.path : undefined,
+      content: typeof parsed.content === "string" ? parsed.content : undefined,
+      query: typeof parsed.query === "string" ? parsed.query : undefined,
+      recursive: typeof parsed.recursive === "boolean" ? parsed.recursive : undefined,
+      replace: typeof parsed.replace === "boolean" ? parsed.replace : undefined,
+    };
+  } catch {
+    return null;
+  }
+};
+
 const encodeGithubPath = (path: string) =>
   path
     .split("/")
     .filter(Boolean)
     .map((segment) => encodeURIComponent(segment))
     .join("/");
+
+const resolveGithubSyncRootPath = (raw: string) => {
+  const value = raw.trim();
+  if (!value) {
+    return ".ipcoder-sync/files";
+  }
+  if (value.endsWith(".json")) {
+    return ".ipcoder-sync/files";
+  }
+  return value.replace(/^\/+/, "").replace(/\/+$/, "");
+};
 
 const computeLineDiff = (beforeText: string, afterText: string) => {
   const before = beforeText.split("\n");
@@ -926,6 +1030,8 @@ function IPCoderApp() {
   const [aiPrompt, setAiPrompt] = useState<string>("");
   const [aiMessages, setAiMessages] = useState<AiMessage[]>([]);
   const [aiBusy, setAiBusy] = useState<boolean>(false);
+  const [aiAgentMode, setAiAgentMode] = useState<boolean>(true);
+  const [aiConfigVisible, setAiConfigVisible] = useState<boolean>(false);
   const [aiApiKeyDraft, setAiApiKeyDraft] = useState<string>(DEFAULT_SETTINGS.aiApiKey);
   const [aiModelDraft, setAiModelDraft] = useState<string>(DEFAULT_SETTINGS.aiModel);
   const [saveCopyModalVisible, setSaveCopyModalVisible] = useState<boolean>(false);
@@ -948,6 +1054,24 @@ function IPCoderApp() {
   const [githubTokenDraft, setGithubTokenDraft] = useState<string>(DEFAULT_SETTINGS.githubToken);
   const [githubSyncPathDraft, setGithubSyncPathDraft] = useState<string>(DEFAULT_SETTINGS.githubSyncPath);
   const [githubSyncBusy, setGithubSyncBusy] = useState<boolean>(false);
+  const [githubFileSyncState, setGithubFileSyncState] = useState<GithubFileSyncState>({
+    hashes: {},
+    lastSyncAt: 0,
+  });
+  const [historyVisible, setHistoryVisible] = useState<boolean>(false);
+  const [restorePoints, setRestorePoints] = useState<RestorePoint[]>([]);
+  const [bookmarksVisible, setBookmarksVisible] = useState<boolean>(false);
+  const [bookmarks, setBookmarks] = useState<BookmarkEntry[]>([]);
+  const [pinnedTabPaths, setPinnedTabPaths] = useState<string[]>([]);
+  const [fileFilterQuery, setFileFilterQuery] = useState<string>("");
+  const [conflictVisible, setConflictVisible] = useState<boolean>(false);
+  const [conflictBusy, setConflictBusy] = useState<boolean>(false);
+  const [conflictPaths, setConflictPaths] = useState<string[]>([]);
+  const [syncQueueVisible, setSyncQueueVisible] = useState<boolean>(false);
+  const [githubSyncQueue, setGithubSyncQueue] = useState<GithubSyncQueueItem[]>([]);
+  const [snapshotVisible, setSnapshotVisible] = useState<boolean>(false);
+  const [snapshotBusy, setSnapshotBusy] = useState<boolean>(false);
+  const [workspaceSnapshots, setWorkspaceSnapshots] = useState<string[]>([]);
   const drawerTranslateX = useRef(new Animated.Value(DRAWER_WIDTH)).current;
   const drawerScrimOpacity = useRef(new Animated.Value(0)).current;
 
@@ -969,10 +1093,21 @@ function IPCoderApp() {
     () => tabs.find((tab) => tab.id === activeTabId) ?? null,
     [tabs, activeTabId],
   );
+  const pinnedTabPathSet = useMemo(() => new Set(pinnedTabPaths), [pinnedTabPaths]);
   const unsavedPathSet = useMemo(
     () => new Set(tabs.filter((tab) => tab.content !== tab.savedContent).map((tab) => tab.path)),
     [tabs],
   );
+  const filteredEntries = useMemo(() => {
+    const query = fileFilterQuery.trim().toLowerCase();
+    if (!query) {
+      return entries;
+    }
+    return entries.filter(
+      (entry) =>
+        entry.name.toLowerCase().includes(query) || formatRelativePath(entry.path).toLowerCase().includes(query),
+    );
+  }, [entries, fileFilterQuery]);
   const diffPreviewLines = useMemo(() => {
     if (!activeTab || activeTab.content === activeTab.savedContent) {
       return [] as Array<{ type: "same" | "add" | "del"; text: string }>;
@@ -1020,6 +1155,35 @@ function IPCoderApp() {
     await AsyncStorage.setItem(STORAGE_PROTECTED_PATHS_KEY, JSON.stringify(deduped));
   }, []);
 
+  const persistGithubFileSyncState = useCallback(async (next: GithubFileSyncState) => {
+    setGithubFileSyncState(next);
+    await AsyncStorage.setItem(STORAGE_GITHUB_FILE_SYNC_STATE_KEY, JSON.stringify(next));
+  }, []);
+
+  const persistRestorePoints = useCallback(async (next: RestorePoint[]) => {
+    const trimmed = next.slice(0, MAX_RESTORE_POINTS);
+    setRestorePoints(trimmed);
+    await AsyncStorage.setItem(STORAGE_RESTORE_POINTS_KEY, JSON.stringify(trimmed));
+  }, []);
+
+  const persistBookmarks = useCallback(async (next: BookmarkEntry[]) => {
+    const trimmed = next.slice(0, MAX_BOOKMARKS);
+    setBookmarks(trimmed);
+    await AsyncStorage.setItem(STORAGE_BOOKMARKS_KEY, JSON.stringify(trimmed));
+  }, []);
+
+  const persistPinnedTabPaths = useCallback(async (next: string[]) => {
+    const deduped = Array.from(new Set(next));
+    setPinnedTabPaths(deduped);
+    await AsyncStorage.setItem(STORAGE_PINNED_TABS_KEY, JSON.stringify(deduped));
+  }, []);
+
+  const persistGithubSyncQueue = useCallback(async (next: GithubSyncQueueItem[]) => {
+    const trimmed = next.slice(0, MAX_SYNC_QUEUE_ITEMS);
+    setGithubSyncQueue(trimmed);
+    await AsyncStorage.setItem(STORAGE_GITHUB_SYNC_QUEUE_KEY, JSON.stringify(trimmed));
+  }, []);
+
   const addCommandHistory = useCallback(
     async (label: string) => {
       const next = [
@@ -1033,6 +1197,86 @@ function IPCoderApp() {
       await persistCommandHistory(next);
     },
     [commandHistory, persistCommandHistory],
+  );
+
+  const addRestorePoint = useCallback(
+    async (path: string, fileName: string, content: string, label: string) => {
+      const next: RestorePoint[] = [
+        {
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          filePath: path,
+          fileName,
+          content,
+          label,
+          timestamp: Date.now(),
+        },
+        ...restorePoints.filter(
+          (entry) =>
+            !(
+              entry.filePath === path &&
+              entry.content === content &&
+              Math.abs(Date.now() - entry.timestamp) < 1500
+            ),
+        ),
+      ];
+      await persistRestorePoints(next);
+    },
+    [persistRestorePoints, restorePoints],
+  );
+
+  const addBookmarkForActiveCursor = useCallback(async () => {
+    if (!activeTab) {
+      return;
+    }
+
+    const next: BookmarkEntry[] = [
+      {
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        filePath: activeTab.path,
+        fileName: activeTab.name,
+        line: activeTab.line,
+        col: activeTab.col,
+        label: `${activeTab.name}:${activeTab.line}`,
+        timestamp: Date.now(),
+      },
+      ...bookmarks.filter(
+        (item) =>
+          !(
+            item.filePath === activeTab.path &&
+            item.line === activeTab.line &&
+            item.col === activeTab.col
+          ),
+      ),
+    ];
+    await persistBookmarks(next);
+    appendAppLog("info", `Bookmark added ${activeTab.name}:${activeTab.line}`);
+  }, [activeTab, appendAppLog, bookmarks, persistBookmarks]);
+
+  const togglePinnedTabPath = useCallback(
+    async (path: string) => {
+      if (pinnedTabPathSet.has(path)) {
+        await persistPinnedTabPaths(pinnedTabPaths.filter((item) => item !== path));
+        return;
+      }
+      await persistPinnedTabPaths([path, ...pinnedTabPaths]);
+    },
+    [persistPinnedTabPaths, pinnedTabPathSet, pinnedTabPaths],
+  );
+
+  const enqueueGithubSync = useCallback(
+    async (kind: GithubSyncQueueItem["kind"], reason: string) => {
+      const next: GithubSyncQueueItem[] = [
+        {
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          kind,
+          reason,
+          createdAt: Date.now(),
+        },
+        ...githubSyncQueue,
+      ];
+      await persistGithubSyncQueue(next);
+    },
+    [githubSyncQueue, persistGithubSyncQueue],
   );
 
   const appendTerminalLog = useCallback((type: TerminalLogEntry["type"], text: string) => {
@@ -1429,6 +1673,11 @@ function IPCoderApp() {
           savedPinnedRaw,
           savedProtectedRaw,
           savedExternalSaveDirRaw,
+          savedGithubFileSyncStateRaw,
+          savedRestorePointsRaw,
+          savedBookmarksRaw,
+          savedPinnedTabsRaw,
+          savedGithubSyncQueueRaw,
         ] = await Promise.all([
           AsyncStorage.getItem(STORAGE_SETTINGS_KEY),
           AsyncStorage.getItem(STORAGE_RECENTS_KEY),
@@ -1438,6 +1687,11 @@ function IPCoderApp() {
           AsyncStorage.getItem(STORAGE_PINNED_FOLDERS_KEY),
           AsyncStorage.getItem(STORAGE_PROTECTED_PATHS_KEY),
           AsyncStorage.getItem(STORAGE_EXTERNAL_SAVE_DIR_KEY),
+          AsyncStorage.getItem(STORAGE_GITHUB_FILE_SYNC_STATE_KEY),
+          AsyncStorage.getItem(STORAGE_RESTORE_POINTS_KEY),
+          AsyncStorage.getItem(STORAGE_BOOKMARKS_KEY),
+          AsyncStorage.getItem(STORAGE_PINNED_TABS_KEY),
+          AsyncStorage.getItem(STORAGE_GITHUB_SYNC_QUEUE_KEY),
         ]);
 
         if (savedSettingsRaw) {
@@ -1528,6 +1782,90 @@ function IPCoderApp() {
 
         if (savedExternalSaveDirRaw && !cancelled) {
           setExternalSaveDirUri(savedExternalSaveDirRaw);
+        }
+
+        if (savedGithubFileSyncStateRaw && !cancelled) {
+          const parsed = JSON.parse(savedGithubFileSyncStateRaw) as Partial<GithubFileSyncState>;
+          if (parsed && typeof parsed === "object") {
+            setGithubFileSyncState({
+              hashes:
+                parsed.hashes && typeof parsed.hashes === "object"
+                  ? Object.fromEntries(
+                      Object.entries(parsed.hashes).filter(
+                        (entry): entry is [string, string] =>
+                          typeof entry[0] === "string" && typeof entry[1] === "string",
+                      ),
+                    )
+                  : {},
+              lastSyncAt: typeof parsed.lastSyncAt === "number" ? parsed.lastSyncAt : 0,
+            });
+          }
+        }
+
+        if (savedRestorePointsRaw && !cancelled) {
+          const parsed = JSON.parse(savedRestorePointsRaw) as RestorePoint[];
+          if (Array.isArray(parsed)) {
+            setRestorePoints(
+              parsed
+                .filter(
+                  (item): item is RestorePoint =>
+                    !!item &&
+                    typeof item.id === "string" &&
+                    typeof item.filePath === "string" &&
+                    typeof item.fileName === "string" &&
+                    typeof item.content === "string" &&
+                    typeof item.label === "string" &&
+                    typeof item.timestamp === "number",
+                )
+                .slice(0, MAX_RESTORE_POINTS),
+            );
+          }
+        }
+
+        if (savedBookmarksRaw && !cancelled) {
+          const parsed = JSON.parse(savedBookmarksRaw) as BookmarkEntry[];
+          if (Array.isArray(parsed)) {
+            setBookmarks(
+              parsed
+                .filter(
+                  (item): item is BookmarkEntry =>
+                    !!item &&
+                    typeof item.id === "string" &&
+                    typeof item.filePath === "string" &&
+                    typeof item.fileName === "string" &&
+                    typeof item.line === "number" &&
+                    typeof item.col === "number" &&
+                    typeof item.label === "string" &&
+                    typeof item.timestamp === "number",
+                )
+                .slice(0, MAX_BOOKMARKS),
+            );
+          }
+        }
+
+        if (savedPinnedTabsRaw && !cancelled) {
+          const parsed = JSON.parse(savedPinnedTabsRaw) as string[];
+          if (Array.isArray(parsed)) {
+            setPinnedTabPaths(parsed.filter((item): item is string => typeof item === "string"));
+          }
+        }
+
+        if (savedGithubSyncQueueRaw && !cancelled) {
+          const parsed = JSON.parse(savedGithubSyncQueueRaw) as GithubSyncQueueItem[];
+          if (Array.isArray(parsed)) {
+            setGithubSyncQueue(
+              parsed
+                .filter(
+                  (item): item is GithubSyncQueueItem =>
+                    !!item &&
+                    typeof item.id === "string" &&
+                    (item.kind === "push" || item.kind === "pull") &&
+                    typeof item.reason === "string" &&
+                    typeof item.createdAt === "number",
+                )
+                .slice(0, MAX_SYNC_QUEUE_ITEMS),
+            );
+          }
         }
 
         await createWorkspaceIfMissing();
@@ -1754,7 +2092,10 @@ function IPCoderApp() {
 
         if (nextTabs.length >= MAX_TABS) {
           const removableIndex = nextTabs.findIndex(
-            (tab) => tab.id !== activeTabId && tab.content === tab.savedContent,
+            (tab) =>
+              tab.id !== activeTabId &&
+              tab.content === tab.savedContent &&
+              !pinnedTabPathSet.has(tab.path),
           );
 
           if (removableIndex === -1) {
@@ -1790,7 +2131,7 @@ function IPCoderApp() {
         Alert.alert("Open Error", "Unable to open the selected file.");
       }
     },
-    [activeTabId, appendAppLog, tabs, touchRecentFile],
+    [activeTabId, appendAppLog, pinnedTabPathSet, tabs, touchRecentFile],
   );
 
   const backupFileIfNeeded = useCallback(async (path: string, content: string) => {
@@ -1810,17 +2151,28 @@ function IPCoderApp() {
     }
   }, []);
 
-  const performSaveActiveTab = useCallback(async () => {
+  const performSaveActiveTab = useCallback(
+    async (options?: { source?: "manual" | "autosave"; silent?: boolean }) => {
     if (!activeTab) {
       return;
     }
     if (readOnlyMode || isProtectedPath(activeTab.path)) {
-      Alert.alert("Read Only", "Current file is protected or read-only.");
+      if (!options?.silent) {
+        Alert.alert("Read Only", "Current file is protected or read-only.");
+      }
       return;
     }
 
     try {
       const isExternal = activeTab.path.startsWith("content://");
+      if (activeTab.savedContent !== activeTab.content) {
+        await addRestorePoint(
+          activeTab.path,
+          activeTab.name,
+          activeTab.savedContent,
+          "pre-save",
+        );
+      }
       if (!isExternal) {
         await backupFileIfNeeded(activeTab.path, activeTab.savedContent);
       }
@@ -1854,38 +2206,135 @@ function IPCoderApp() {
       if (!isExternal) {
         await refreshCurrentDirectory();
       }
-      await addCommandHistory(`Save ${activeTab.name}`);
-      appendAppLog("info", `Saved ${activeTab.name}`);
+      if (options?.source !== "autosave") {
+        await addCommandHistory(`Save ${activeTab.name}`);
+      }
+      appendAppLog("info", `${options?.source === "autosave" ? "Autosaved" : "Saved"} ${activeTab.name}`);
     } catch (error) {
       console.error(error);
       appendAppLog("error", `Save Error: ${String(error)}`);
-      Alert.alert("Save Error", "Unable to save the current file.");
+      if (!options?.silent) {
+        Alert.alert("Save Error", "Unable to save the current file.");
+      }
     }
-  }, [
-    activeTab,
-    addCommandHistory,
-    appendAppLog,
-    backupFileIfNeeded,
-    isProtectedPath,
-    readOnlyMode,
-    refreshCurrentDirectory,
-    touchRecentFile,
-  ]);
+  },
+    [
+      activeTab,
+      addRestorePoint,
+      addCommandHistory,
+      appendAppLog,
+      backupFileIfNeeded,
+      isProtectedPath,
+      readOnlyMode,
+      refreshCurrentDirectory,
+      touchRecentFile,
+    ],
+  );
 
   const saveActiveTab = useCallback(
-    async (options?: { skipDiff?: boolean }) => {
+    async (options?: { skipDiff?: boolean; source?: "manual" | "autosave"; silent?: boolean }) => {
       if (!activeTab) {
         return;
       }
 
-      if (!options?.skipDiff && activeTab.content !== activeTab.savedContent) {
+      if (!options?.skipDiff && options?.source !== "autosave" && activeTab.content !== activeTab.savedContent) {
         setDiffVisible(true);
         return;
       }
 
-      await performSaveActiveTab();
+      await performSaveActiveTab({
+        source: options?.source ?? "manual",
+        silent: options?.silent,
+      });
     },
     [activeTab, performSaveActiveTab],
+  );
+
+  useEffect(() => {
+    if (!settings.autoSave || !activeTab) {
+      return;
+    }
+    if (activeTab.content === activeTab.savedContent) {
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      void saveActiveTab({
+        skipDiff: true,
+        source: "autosave",
+        silent: true,
+      });
+    }, AUTO_SAVE_DELAY_MS);
+
+    return () => {
+      clearTimeout(timeout);
+    };
+  }, [activeTab, saveActiveTab, settings.autoSave]);
+
+  const visibleRestorePoints = useMemo(() => {
+    if (!activeTab) {
+      return restorePoints;
+    }
+    const forTab = restorePoints.filter((item) => item.filePath === activeTab.path);
+    return forTab.length ? forTab : restorePoints;
+  }, [activeTab, restorePoints]);
+
+  const visibleBookmarks = useMemo(() => {
+    if (!activeTab) {
+      return bookmarks;
+    }
+    const forTab = bookmarks.filter((item) => item.filePath === activeTab.path);
+    return forTab.length ? forTab : bookmarks;
+  }, [activeTab, bookmarks]);
+
+  const restoreFromPoint = useCallback(
+    async (point: RestorePoint) => {
+      if (readOnlyMode || isProtectedPath(point.filePath)) {
+        Alert.alert("Restore", "Path is read-only or protected.");
+        return;
+      }
+
+      try {
+        if (point.filePath.startsWith("content://")) {
+          await FileSystem.StorageAccessFramework.writeAsStringAsync(
+            point.filePath,
+            point.content,
+            {
+              encoding: FileSystem.EncodingType.UTF8,
+            },
+          );
+        } else {
+          await FileSystem.writeAsStringAsync(point.filePath, point.content, {
+            encoding: FileSystem.EncodingType.UTF8,
+          });
+        }
+
+        setTabs((prev) =>
+          prev.map((tab) =>
+            tab.path === point.filePath
+              ? {
+                  ...tab,
+                  content: point.content,
+                  savedContent: point.content,
+                }
+              : tab,
+          ),
+        );
+
+        if (!point.filePath.startsWith("content://")) {
+          await refreshCurrentDirectory();
+        }
+
+        appendAppLog("info", `Restored ${point.fileName} from ${point.label} point.`);
+        await addCommandHistory(`Restore ${point.fileName}`);
+        Alert.alert("Restore", "Restore point applied.");
+      } catch (error) {
+        console.error(error);
+        appendAppLog("error", `Restore error: ${String(error)}`);
+        Alert.alert("Restore", "Failed to apply restore point.");
+      }
+    },
+    [addCommandHistory, appendAppLog, isProtectedPath, readOnlyMode, refreshCurrentDirectory],
   );
 
   const closeTab = useCallback(
@@ -2038,7 +2487,7 @@ function IPCoderApp() {
           content,
           timestamp: Date.now(),
         },
-      ].slice(-MAX_AI_MESSAGES),
+      ],
     );
   }, []);
 
@@ -2061,7 +2510,7 @@ function IPCoderApp() {
       githubRepo: githubRepoDraft.trim(),
       githubBranch: githubBranchDraft.trim() || "main",
       githubToken: githubTokenDraft.trim(),
-      githubSyncPath: githubSyncPathDraft.trim() || ".ipcoder-sync/workspace.json",
+      githubSyncPath: githubSyncPathDraft.trim() || ".ipcoder-sync/files",
     });
     appendAppLog("info", "GitHub sync configuration updated.");
     Alert.alert("GitHub Sync", "Repository settings saved.");
@@ -2110,105 +2559,274 @@ function IPCoderApp() {
     }
   }, []);
 
-  const buildWorkspaceSnapshot = useCallback(async () => {
+  const listWorkspaceTextFilesForSync = useCallback(async () => {
     const files = (await listWorkspaceFiles())
       .filter((entry) => !entry.isDirectory)
       .filter((entry) => pathIsWithin(entry.path, WORKSPACE_ROOT))
       .filter((entry) => !entry.path.includes("/.ipcoder/backups/"))
       .sort((left, right) => left.path.localeCompare(right.path));
 
-    const snapshotFiles: Array<{ path: string; content: string }> = [];
+    const collected: Array<{ relativePath: string; content: string }> = [];
     for (const entry of files) {
       const content = await readFileAsTextSafe(entry.path);
       if (content === null) {
         continue;
       }
-      snapshotFiles.push({
-        path: entry.path.replace(`${stripTrailingSlash(WORKSPACE_ROOT)}/`, ""),
-        content,
-      });
+      const relativePath = entry.path.replace(`${stripTrailingSlash(WORKSPACE_ROOT)}/`, "");
+      collected.push({ relativePath, content });
     }
-
-    return JSON.stringify(
-      {
-        version: 1,
-        timestamp: Date.now(),
-        files: snapshotFiles,
-      },
-      null,
-      2,
-    );
+    return collected;
   }, [listWorkspaceFiles, readFileAsTextSafe]);
 
-  const pushWorkspaceSnapshotToGithub = useCallback(async () => {
+  const githubHeaders = useCallback(
+    (token: string, withBody = false) =>
+      ({
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${token}`,
+        ...(withBody ? { "Content-Type": "application/json" } : {}),
+        "X-GitHub-Api-Version": "2022-11-28",
+      }) as Record<string, string>,
+    [],
+  );
+
+  const githubGetFile = useCallback(
+    async (
+      owner: string,
+      repo: string,
+      branch: string,
+      token: string,
+      path: string,
+    ): Promise<{ exists: false } | { exists: true; sha: string; content: string }> => {
+      const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeGithubPath(path)}?ref=${encodeURIComponent(branch)}`;
+      const res = await fetch(url, {
+        method: "GET",
+        headers: githubHeaders(token),
+      });
+
+      if (res.status === 404) {
+        return { exists: false };
+      }
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`GitHub read failed (${res.status}): ${text}`);
+      }
+
+      const payload = (await res.json()) as {
+        sha?: unknown;
+        content?: unknown;
+        encoding?: unknown;
+        type?: unknown;
+      };
+
+      if (
+        payload.type !== "file" ||
+        typeof payload.sha !== "string" ||
+        payload.encoding !== "base64" ||
+        typeof payload.content !== "string"
+      ) {
+        throw new Error(`GitHub path is not a readable file: ${path}`);
+      }
+
+      const decoded = await decodeBase64ToString(payload.content);
+      return {
+        exists: true,
+        sha: payload.sha,
+        content: decoded,
+      };
+    },
+    [decodeBase64ToString, githubHeaders],
+  );
+
+  const githubUpsertFile = useCallback(
+    async (
+      owner: string,
+      repo: string,
+      branch: string,
+      token: string,
+      path: string,
+      content: string,
+      sha?: string,
+    ) => {
+      const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeGithubPath(path)}`;
+      const base64 = await encodeStringToBase64(content);
+      const res = await fetch(url, {
+        method: "PUT",
+        headers: githubHeaders(token, true),
+        body: JSON.stringify({
+          message: `IPCoder sync update ${path}`,
+          content: base64,
+          branch,
+          ...(sha ? { sha } : {}),
+        }),
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`GitHub write failed (${res.status}): ${text}`);
+      }
+    },
+    [encodeStringToBase64, githubHeaders],
+  );
+
+  const githubListFilesRecursively = useCallback(
+    async (
+      owner: string,
+      repo: string,
+      branch: string,
+      token: string,
+      basePath: string,
+    ): Promise<Array<{ path: string }>> => {
+      const walk = async (path: string): Promise<Array<{ path: string }>> => {
+        const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeGithubPath(path)}?ref=${encodeURIComponent(branch)}`;
+        const res = await fetch(url, {
+          method: "GET",
+          headers: githubHeaders(token),
+        });
+
+        if (res.status === 404) {
+          return [];
+        }
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`GitHub list failed (${res.status}): ${text}`);
+        }
+
+        const payload = (await res.json()) as unknown;
+        if (!Array.isArray(payload)) {
+          return [];
+        }
+
+        const out: Array<{ path: string }> = [];
+        for (const item of payload as Array<{ type?: unknown; path?: unknown }>) {
+          if (!item || typeof item.path !== "string") {
+            continue;
+          }
+          if (item.type === "file") {
+            out.push({ path: item.path });
+            continue;
+          }
+          if (item.type === "dir") {
+            const nested = await walk(item.path);
+            out.push(...nested);
+          }
+        }
+        return out;
+      };
+
+      return walk(basePath);
+    },
+    [githubHeaders],
+  );
+
+  const buildConflictMarkers = useCallback((localText: string, remoteText: string) => {
+    return [
+      "<<<<<<< LOCAL",
+      localText,
+      "=======",
+      remoteText,
+      ">>>>>>> REMOTE",
+      "",
+    ].join("\n");
+  }, []);
+
+  const pushWorkspaceFilesToGithub = useCallback(async () => {
     const owner = settings.githubOwner.trim();
     const repo = settings.githubRepo.trim();
     const branch = settings.githubBranch.trim() || "main";
     const token = settings.githubToken.trim();
-    const syncPath = settings.githubSyncPath.trim() || ".ipcoder-sync/workspace.json";
+    const syncRoot = resolveGithubSyncRootPath(settings.githubSyncPath);
 
     if (!owner || !repo || !token) {
       Alert.alert("GitHub Sync", "Set owner, repo, and token in settings.");
-      return;
+      return false;
     }
 
     setGithubSyncBusy(true);
     try {
-      const snapshot = await buildWorkspaceSnapshot();
-      const contentB64 = await encodeStringToBase64(snapshot);
-      const pathEncoded = encodeGithubPath(syncPath);
-      const fileUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${pathEncoded}`;
-      const headers = {
-        Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        "X-GitHub-Api-Version": "2022-11-28",
-      };
+      const files = await listWorkspaceTextFilesForSync();
+      const nextHashes = { ...githubFileSyncState.hashes };
+      let uploaded = 0;
+      let skipped = 0;
+      let conflicts = 0;
 
-      let existingSha: string | undefined;
-      const existingRes = await fetch(`${fileUrl}?ref=${encodeURIComponent(branch)}`, {
-        method: "GET",
-        headers,
-      });
-      if (existingRes.ok) {
-        const payload = (await existingRes.json()) as { sha?: string };
-        existingSha = payload.sha;
-      } else if (existingRes.status !== 404) {
-        const text = await existingRes.text();
-        throw new Error(`GitHub read failed (${existingRes.status}): ${text}`);
-      }
+      for (const file of files) {
+        const remotePath = `${syncRoot}/${file.relativePath}`;
+        const localHash = quickHash(file.content);
+        const baseHash = githubFileSyncState.hashes[file.relativePath];
 
-      const putRes = await fetch(fileUrl, {
-        method: "PUT",
-        headers,
-        body: JSON.stringify({
-          message: `IPCoder sync ${new Date().toISOString()}`,
-          content: contentB64,
+        const remote = await githubGetFile(owner, repo, branch, token, remotePath);
+        if (!remote.exists) {
+          await githubUpsertFile(owner, repo, branch, token, remotePath, file.content);
+          nextHashes[file.relativePath] = localHash;
+          uploaded += 1;
+          continue;
+        }
+
+        const remoteHash = quickHash(remote.content);
+        if (remoteHash === localHash) {
+          nextHashes[file.relativePath] = localHash;
+          skipped += 1;
+          continue;
+        }
+
+        const isConflict =
+          typeof baseHash === "string" &&
+          localHash !== baseHash &&
+          remoteHash !== baseHash &&
+          localHash !== remoteHash;
+
+        if (isConflict) {
+          conflicts += 1;
+          appendAppLog("error", `GitHub push conflict: ${file.relativePath}`);
+          continue;
+        }
+
+        await githubUpsertFile(
+          owner,
+          repo,
           branch,
-          sha: existingSha,
-        }),
-      });
-
-      if (!putRes.ok) {
-        const text = await putRes.text();
-        throw new Error(`GitHub push failed (${putRes.status}): ${text}`);
+          token,
+          remotePath,
+          file.content,
+          remote.sha,
+        );
+        nextHashes[file.relativePath] = localHash;
+        uploaded += 1;
       }
 
-      appendAppLog("info", `GitHub push completed (${owner}/${repo}@${branch}).`);
-      await addCommandHistory("GitHub Sync Push");
-      Alert.alert("GitHub Sync", "Workspace snapshot pushed.");
+      await persistGithubFileSyncState({
+        hashes: nextHashes,
+        lastSyncAt: Date.now(),
+      });
+
+      appendAppLog(
+        "info",
+        `GitHub per-file push done: ${uploaded} uploaded, ${skipped} unchanged, ${conflicts} conflicts.`,
+      );
+      await addCommandHistory("GitHub File Sync Push");
+      Alert.alert(
+        "GitHub Sync",
+        `Push complete.\nUploaded: ${uploaded}\nUnchanged: ${skipped}\nConflicts: ${conflicts}`,
+      );
+      return true;
     } catch (error) {
       console.error(error);
-      appendAppLog("error", `GitHub push error: ${String(error)}`);
-      Alert.alert("GitHub Sync", "Push failed. Check token/repo/path permissions.");
+      appendAppLog("error", `GitHub per-file push error: ${String(error)}`);
+      await enqueueGithubSync("push", String(error));
+      Alert.alert("GitHub Sync", "Per-file push failed.");
+      return false;
     } finally {
       setGithubSyncBusy(false);
     }
   }, [
     addCommandHistory,
     appendAppLog,
-    buildWorkspaceSnapshot,
-    encodeStringToBase64,
+    enqueueGithubSync,
+    githubFileSyncState.hashes,
+    githubGetFile,
+    githubUpsertFile,
+    listWorkspaceTextFilesForSync,
+    persistGithubFileSyncState,
     settings.githubBranch,
     settings.githubOwner,
     settings.githubRepo,
@@ -2216,77 +2834,107 @@ function IPCoderApp() {
     settings.githubToken,
   ]);
 
-  const pullWorkspaceSnapshotFromGithub = useCallback(async () => {
+  const pullWorkspaceFilesFromGithub = useCallback(async () => {
     const owner = settings.githubOwner.trim();
     const repo = settings.githubRepo.trim();
     const branch = settings.githubBranch.trim() || "main";
     const token = settings.githubToken.trim();
-    const syncPath = settings.githubSyncPath.trim() || ".ipcoder-sync/workspace.json";
+    const syncRoot = resolveGithubSyncRootPath(settings.githubSyncPath);
 
     if (!owner || !repo || !token) {
       Alert.alert("GitHub Sync", "Set owner, repo, and token in settings.");
-      return;
+      return false;
     }
 
     setGithubSyncBusy(true);
     try {
-      const pathEncoded = encodeGithubPath(syncPath);
-      const fileUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${pathEncoded}?ref=${encodeURIComponent(branch)}`;
-      const res = await fetch(fileUrl, {
-        method: "GET",
-        headers: {
-          Accept: "application/vnd.github+json",
-          Authorization: `Bearer ${token}`,
-          "X-GitHub-Api-Version": "2022-11-28",
-        },
+      const remoteFiles = await githubListFilesRecursively(owner, repo, branch, token, syncRoot);
+      const nextHashes = { ...githubFileSyncState.hashes };
+      let pulled = 0;
+      let conflicts = 0;
+
+      for (const remoteItem of remoteFiles) {
+        if (!remoteItem.path.startsWith(`${syncRoot}/`)) {
+          continue;
+        }
+        const relativePath = remoteItem.path.slice(syncRoot.length + 1);
+        if (!relativePath || relativePath.includes("..")) {
+          continue;
+        }
+
+        const remote = await githubGetFile(owner, repo, branch, token, remoteItem.path);
+        if (!remote.exists) {
+          continue;
+        }
+
+        const remoteHash = quickHash(remote.content);
+        const destination = joinFsPath(WORKSPACE_ROOT, relativePath);
+        const baseHash = githubFileSyncState.hashes[relativePath];
+        const localContent = await readFileAsTextSafe(destination);
+        const localHash = localContent === null ? undefined : quickHash(localContent);
+
+        const conflict =
+          typeof baseHash === "string" &&
+          typeof localHash === "string" &&
+          localHash !== baseHash &&
+          remoteHash !== baseHash &&
+          localHash !== remoteHash;
+
+        const folder = parentPath(destination, WORKSPACE_ROOT);
+        await FileSystem.makeDirectoryAsync(folder, { intermediates: true });
+
+        if (conflict && typeof localContent === "string") {
+          const merged = buildConflictMarkers(localContent, remote.content);
+          await FileSystem.writeAsStringAsync(destination, merged, {
+            encoding: FileSystem.EncodingType.UTF8,
+          });
+          conflicts += 1;
+          appendAppLog("error", `GitHub pull conflict markers written: ${relativePath}`);
+        } else {
+          await FileSystem.writeAsStringAsync(destination, remote.content, {
+            encoding: FileSystem.EncodingType.UTF8,
+          });
+          pulled += 1;
+        }
+
+        nextHashes[relativePath] = remoteHash;
+      }
+
+      await persistGithubFileSyncState({
+        hashes: nextHashes,
+        lastSyncAt: Date.now(),
       });
 
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`GitHub pull failed (${res.status}): ${text}`);
-      }
-
-      const payload = (await res.json()) as { content?: string; encoding?: string };
-      if (!payload.content || payload.encoding !== "base64") {
-        throw new Error("Sync file is missing base64 content.");
-      }
-
-      const decoded = await decodeBase64ToString(payload.content);
-      const snapshot = JSON.parse(decoded) as {
-        files?: Array<{ path?: unknown; content?: unknown }>;
-      };
-
-      const files = Array.isArray(snapshot.files) ? snapshot.files : [];
-      for (const item of files) {
-        if (typeof item.path !== "string" || typeof item.content !== "string") {
-          continue;
-        }
-        if (!item.path || item.path.includes("..")) {
-          continue;
-        }
-        const destination = joinFsPath(WORKSPACE_ROOT, item.path);
-        const parent = parentPath(destination, WORKSPACE_ROOT);
-        await FileSystem.makeDirectoryAsync(parent, { intermediates: true });
-        await FileSystem.writeAsStringAsync(destination, item.content, {
-          encoding: FileSystem.EncodingType.UTF8,
-        });
-      }
-
       await refreshCurrentDirectory();
-      appendAppLog("info", `GitHub pull completed (${owner}/${repo}@${branch}).`);
-      await addCommandHistory("GitHub Sync Pull");
-      Alert.alert("GitHub Sync", "Workspace snapshot pulled.");
+      appendAppLog(
+        "info",
+        `GitHub per-file pull done: ${pulled} updated, ${conflicts} conflicts.`,
+      );
+      await addCommandHistory("GitHub File Sync Pull");
+      Alert.alert(
+        "GitHub Sync",
+        `Pull complete.\nUpdated: ${pulled}\nConflicts: ${conflicts}`,
+      );
+      return true;
     } catch (error) {
       console.error(error);
-      appendAppLog("error", `GitHub pull error: ${String(error)}`);
-      Alert.alert("GitHub Sync", "Pull failed. Check token/repo/path permissions.");
+      appendAppLog("error", `GitHub per-file pull error: ${String(error)}`);
+      await enqueueGithubSync("pull", String(error));
+      Alert.alert("GitHub Sync", "Per-file pull failed.");
+      return false;
     } finally {
       setGithubSyncBusy(false);
     }
   }, [
     addCommandHistory,
     appendAppLog,
-    decodeBase64ToString,
+    buildConflictMarkers,
+    enqueueGithubSync,
+    githubFileSyncState.hashes,
+    githubGetFile,
+    githubListFilesRecursively,
+    persistGithubFileSyncState,
+    readFileAsTextSafe,
     refreshCurrentDirectory,
     settings.githubBranch,
     settings.githubOwner,
@@ -2294,6 +2942,232 @@ function IPCoderApp() {
     settings.githubSyncPath,
     settings.githubToken,
   ]);
+
+  const retryQueuedGithubSync = useCallback(
+    async (item: GithubSyncQueueItem) => {
+      const success =
+        item.kind === "push"
+          ? await pushWorkspaceFilesToGithub()
+          : await pullWorkspaceFilesFromGithub();
+      if (!success) {
+        return;
+      }
+      await persistGithubSyncQueue(githubSyncQueue.filter((queued) => queued.id !== item.id));
+      appendAppLog("info", `Queue retry success (${item.kind})`);
+    },
+    [
+      appendAppLog,
+      githubSyncQueue,
+      persistGithubSyncQueue,
+      pullWorkspaceFilesFromGithub,
+      pushWorkspaceFilesToGithub,
+    ],
+  );
+
+  const runConflictScan = useCallback(async () => {
+    setConflictBusy(true);
+    try {
+      const files = await listWorkspaceTextFilesForSync();
+      const found = files
+        .filter((file) => file.content.includes("<<<<<<< LOCAL") && file.content.includes(">>>>>>> REMOTE"))
+        .map((file) => joinFsPath(WORKSPACE_ROOT, file.relativePath));
+      setConflictPaths(found);
+      appendAppLog("info", `Conflict scan complete (${found.length} file(s)).`);
+    } catch (error) {
+      console.error(error);
+      appendAppLog("error", `Conflict scan failed: ${String(error)}`);
+      Alert.alert("Conflict Center", "Failed to scan workspace files.");
+    } finally {
+      setConflictBusy(false);
+    }
+  }, [appendAppLog, listWorkspaceTextFilesForSync]);
+
+  const listWorkspaceSnapshots = useCallback(async () => {
+    const snapshotDir = joinFsPath(WORKSPACE_ROOT, ".ipcoder/snapshots");
+    await FileSystem.makeDirectoryAsync(snapshotDir, { intermediates: true });
+    const names = await FileSystem.readDirectoryAsync(snapshotDir);
+    const mapped = names
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => joinFsPath(snapshotDir, name))
+      .sort((left, right) => right.localeCompare(left))
+      .slice(0, 40);
+    setWorkspaceSnapshots(mapped);
+  }, []);
+
+  const exportWorkspaceSnapshot = useCallback(async () => {
+    setSnapshotBusy(true);
+    try {
+      const snapshotDir = joinFsPath(WORKSPACE_ROOT, ".ipcoder/snapshots");
+      await FileSystem.makeDirectoryAsync(snapshotDir, { intermediates: true });
+      const filename = `snapshot-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+      const path = joinFsPath(snapshotDir, filename);
+      const payload: WorkspaceSnapshotPayload = {
+        version: 1,
+        createdAt: Date.now(),
+        settings,
+        recents,
+        commandHistory,
+        trackerState,
+        pinnedFolders,
+        protectedPaths,
+        restorePoints,
+        bookmarks,
+        pinnedTabPaths,
+        githubFileSyncState,
+        session: {
+          tabs: tabs.map((tab) => ({
+            id: tab.id,
+            path: tab.path,
+            name: tab.name,
+            language: tab.language,
+            content: tab.content,
+            savedContent: tab.savedContent,
+            line: tab.line,
+            col: tab.col,
+          })),
+          activeTabId,
+          currentDirectory,
+          timestamp: Date.now(),
+        },
+      };
+      await FileSystem.writeAsStringAsync(path, JSON.stringify(payload, null, 2), {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+      await listWorkspaceSnapshots();
+      appendAppLog("info", `Snapshot exported: ${filename}`);
+      Alert.alert("Snapshot", `Exported ${filename}`);
+    } catch (error) {
+      console.error(error);
+      appendAppLog("error", `Snapshot export failed: ${String(error)}`);
+      Alert.alert("Snapshot", "Failed to export workspace snapshot.");
+    } finally {
+      setSnapshotBusy(false);
+    }
+  }, [
+    activeTabId,
+    bookmarks,
+    commandHistory,
+    currentDirectory,
+    githubFileSyncState,
+    listWorkspaceSnapshots,
+    pinnedFolders,
+    pinnedTabPaths,
+    protectedPaths,
+    recents,
+    restorePoints,
+    settings,
+    tabs,
+    trackerState,
+    appendAppLog,
+  ]);
+
+  const importWorkspaceSnapshot = useCallback(
+    async (path: string) => {
+      setSnapshotBusy(true);
+      try {
+        const raw = await FileSystem.readAsStringAsync(path, {
+          encoding: FileSystem.EncodingType.UTF8,
+        });
+        const parsed = JSON.parse(raw) as Partial<WorkspaceSnapshotPayload>;
+        if (!parsed || typeof parsed !== "object" || !parsed.session) {
+          throw new Error("Invalid snapshot");
+        }
+        const session = parsed.session;
+
+        const nextSettings = { ...DEFAULT_SETTINGS, ...(parsed.settings ?? {}) };
+        await persistSettings(nextSettings);
+
+        if (Array.isArray(parsed.recents)) {
+          await persistRecents(parsed.recents.slice(0, MAX_RECENT_FILES));
+        }
+        if (Array.isArray(parsed.commandHistory)) {
+          await persistCommandHistory(parsed.commandHistory.slice(0, MAX_COMMAND_HISTORY));
+        }
+        if (parsed.trackerState && typeof parsed.trackerState === "object") {
+          await persistTrackerState(parsed.trackerState as TrackerState);
+        }
+        if (Array.isArray(parsed.pinnedFolders)) {
+          await persistPinnedFolders(parsed.pinnedFolders);
+        }
+        if (Array.isArray(parsed.protectedPaths)) {
+          await persistProtectedPaths(parsed.protectedPaths);
+        }
+        if (Array.isArray(parsed.restorePoints)) {
+          await persistRestorePoints(parsed.restorePoints as RestorePoint[]);
+        }
+        if (Array.isArray(parsed.bookmarks)) {
+          await persistBookmarks(parsed.bookmarks as BookmarkEntry[]);
+        }
+        if (Array.isArray(parsed.pinnedTabPaths)) {
+          await persistPinnedTabPaths(parsed.pinnedTabPaths.filter((item): item is string => typeof item === "string"));
+        }
+        if (parsed.githubFileSyncState && typeof parsed.githubFileSyncState === "object") {
+          await persistGithubFileSyncState(parsed.githubFileSyncState as GithubFileSyncState);
+        }
+
+        const sessionTabs = Array.isArray(session.tabs)
+          ? session.tabs
+              .map(coercePersistedTab)
+              .filter((item): item is PersistedSessionTab => item !== null)
+              .filter(
+                (item) =>
+                  pathIsWithin(item.path, WORKSPACE_ROOT) || item.path.startsWith("content://"),
+              )
+              .slice(0, MAX_TABS)
+          : [];
+        setTabs(sessionTabs);
+        setActiveTabId(
+          typeof session.activeTabId === "string"
+            ? sessionTabs.find((tab) => tab.id === session.activeTabId)?.id ?? sessionTabs[0]?.id ?? null
+            : sessionTabs[0]?.id ?? null,
+        );
+        if (
+          typeof session.currentDirectory === "string" &&
+          pathIsWithin(session.currentDirectory, WORKSPACE_ROOT)
+        ) {
+          setCurrentDirectory(session.currentDirectory);
+        }
+
+        await addCommandHistory(`Import Snapshot ${basename(path)}`);
+        appendAppLog("info", `Snapshot imported: ${basename(path)}`);
+        Alert.alert("Snapshot", "Workspace snapshot imported.");
+      } catch (error) {
+        console.error(error);
+        appendAppLog("error", `Snapshot import failed: ${String(error)}`);
+        Alert.alert("Snapshot", "Failed to import snapshot.");
+      } finally {
+        setSnapshotBusy(false);
+      }
+    },
+    [
+      addCommandHistory,
+      appendAppLog,
+      persistBookmarks,
+      persistCommandHistory,
+      persistGithubFileSyncState,
+      persistPinnedFolders,
+      persistPinnedTabPaths,
+      persistProtectedPaths,
+      persistRecents,
+      persistRestorePoints,
+      persistSettings,
+      persistTrackerState,
+    ],
+  );
+
+  useEffect(() => {
+    if (!conflictVisible) {
+      return;
+    }
+    void runConflictScan();
+  }, [conflictVisible, runConflictScan]);
+
+  useEffect(() => {
+    if (!snapshotVisible) {
+      return;
+    }
+    void listWorkspaceSnapshots();
+  }, [listWorkspaceSnapshots, snapshotVisible]);
 
   const createProjectFromTemplate = useCallback(
     async (template: ProjectTemplate) => {
@@ -2352,6 +3226,188 @@ function IPCoderApp() {
     ],
   );
 
+  const resolveAiPath = useCallback(
+    (inputPath?: string) => {
+      const raw = (inputPath ?? "").trim();
+      if (!raw) {
+        return currentDirectory;
+      }
+      if (raw.startsWith("content://")) {
+        return raw;
+      }
+      if (raw.startsWith("/")) {
+        return pathIsWithin(raw, WORKSPACE_ROOT) ? raw : null;
+      }
+      if (raw === "workspace") {
+        return WORKSPACE_ROOT;
+      }
+      if (raw.startsWith("workspace/")) {
+        const resolved = joinFsPath(WORKSPACE_ROOT, raw.replace(/^workspace\//, ""));
+        return pathIsWithin(resolved, WORKSPACE_ROOT) ? resolved : null;
+      }
+      const resolved = joinFsPath(currentDirectory, raw.replace(/^\.\//, ""));
+      return pathIsWithin(resolved, WORKSPACE_ROOT) ? resolved : null;
+    },
+    [currentDirectory],
+  );
+
+  const executeAiToolRequest = useCallback(
+    async (request: AiToolRequest) => {
+      const action = request.action.trim().toLowerCase();
+
+      if (action === "list_files") {
+        const targetPath = resolveAiPath(request.path);
+        if (!targetPath) {
+          return { ok: false, error: "Invalid path." };
+        }
+        if (request.recursive) {
+          const entriesInTree = await listWorkspaceFiles(targetPath);
+          return {
+            ok: true,
+            action,
+            base: formatRelativePath(targetPath),
+            entries: entriesInTree.map((entry) => ({
+              path: formatRelativePath(entry.path),
+              isDirectory: entry.isDirectory,
+              modifiedAt: entry.modifiedAt,
+            })),
+          };
+        }
+
+        const names = await FileSystem.readDirectoryAsync(targetPath);
+        const entriesInDir = await Promise.all(
+          names.map(async (name) => {
+            const entryPath = joinFsPath(targetPath, name);
+            const info = await FileSystem.getInfoAsync(entryPath);
+            return {
+              path: formatRelativePath(entryPath),
+              name,
+              isDirectory: !!info.isDirectory,
+            };
+          }),
+        );
+        return { ok: true, action, base: formatRelativePath(targetPath), entries: entriesInDir };
+      }
+
+      if (action === "read_file") {
+        const targetPath = resolveAiPath(request.path);
+        if (!targetPath) {
+          return { ok: false, error: "Invalid path." };
+        }
+        const content = targetPath.startsWith("content://")
+          ? await FileSystem.StorageAccessFramework.readAsStringAsync(targetPath, {
+              encoding: FileSystem.EncodingType.UTF8,
+            })
+          : await readFileAsTextSafe(targetPath);
+        if (typeof content !== "string") {
+          return { ok: false, error: "File is binary, unreadable, or missing." };
+        }
+        return { ok: true, action, path: formatRelativePath(targetPath), content };
+      }
+
+      if (action === "write_file") {
+        const targetPath = resolveAiPath(request.path);
+        if (!targetPath || typeof request.content !== "string") {
+          return { ok: false, error: "write_file requires path and content." };
+        }
+        if (!targetPath.startsWith("content://") && (readOnlyMode || isProtectedPath(targetPath))) {
+          return { ok: false, error: "Path is read-only or protected." };
+        }
+        if (targetPath.startsWith("content://")) {
+          await FileSystem.StorageAccessFramework.writeAsStringAsync(targetPath, request.content, {
+            encoding: FileSystem.EncodingType.UTF8,
+          });
+        } else {
+          await FileSystem.makeDirectoryAsync(parentPath(targetPath, WORKSPACE_ROOT), {
+            intermediates: true,
+          });
+          await FileSystem.writeAsStringAsync(targetPath, request.content, {
+            encoding: FileSystem.EncodingType.UTF8,
+          });
+          await refreshCurrentDirectory();
+        }
+        return { ok: true, action, path: formatRelativePath(targetPath) };
+      }
+
+      if (action === "open_file") {
+        const targetPath = resolveAiPath(request.path);
+        if (!targetPath) {
+          return { ok: false, error: "Invalid path." };
+        }
+        if (targetPath.startsWith("content://")) {
+          return { ok: false, error: "open_file currently supports workspace paths only." };
+        }
+        await openFile(targetPath);
+        return { ok: true, action, path: formatRelativePath(targetPath) };
+      }
+
+      if (action === "replace_active_file" || action === "append_active_file") {
+        if (!activeTab) {
+          return { ok: false, error: "No active file open." };
+        }
+        const incoming = request.content ?? "";
+        const next = action === "replace_active_file" ? incoming : `${activeTab.content}${incoming}`;
+        await applyActiveTabContent(
+          next,
+          action === "replace_active_file" ? "AI Agent Replace Active File" : "AI Agent Append Active File",
+        );
+        return { ok: true, action, path: formatRelativePath(activeTab.path) };
+      }
+
+      if (action === "save_active_file") {
+        await saveActiveTab({ skipDiff: true, source: "manual", silent: true });
+        return { ok: true, action, path: activeTab ? formatRelativePath(activeTab.path) : null };
+      }
+
+      if (action === "search_workspace") {
+        const query = (request.query ?? "").trim();
+        if (!query) {
+          return { ok: false, error: "search_workspace requires query." };
+        }
+        const files = await listWorkspaceFiles(WORKSPACE_ROOT);
+        const matches: Array<{ path: string; line: number; snippet: string }> = [];
+        for (const entry of files) {
+          if (entry.isDirectory) {
+            continue;
+          }
+          const content = await readFileAsTextSafe(entry.path);
+          if (typeof content !== "string") {
+            continue;
+          }
+          const lines = content.split("\n");
+          lines.forEach((lineText, idx) => {
+            if (lineText.includes(query)) {
+              matches.push({
+                path: formatRelativePath(entry.path),
+                line: idx + 1,
+                snippet: lineText.trim(),
+              });
+            }
+          });
+        }
+        return { ok: true, action, query, matches };
+      }
+
+      return {
+        ok: false,
+        error:
+          "Unknown action. Supported: list_files, read_file, write_file, open_file, replace_active_file, append_active_file, save_active_file, search_workspace",
+      };
+    },
+    [
+      activeTab,
+      applyActiveTabContent,
+      isProtectedPath,
+      listWorkspaceFiles,
+      openFile,
+      readFileAsTextSafe,
+      readOnlyMode,
+      refreshCurrentDirectory,
+      resolveAiPath,
+      saveActiveTab,
+    ],
+  );
+
   const askAi = useCallback(async () => {
     if (aiBusy) {
       return;
@@ -2374,7 +3430,7 @@ Language: ${activeTab.language}
 Cursor: Ln ${activeTab.line}, Col ${activeTab.col}
 
 File content:
-${activeTab.content.slice(0, 18000)}`
+${activeTab.content}`
       : "No file is currently open.";
 
     const userMessage = prompt;
@@ -2383,61 +3439,99 @@ ${activeTab.content.slice(0, 18000)}`
     setAiBusy(true);
 
     try {
-      const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${settings.aiApiKey.trim()}`,
+      const baseMessages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+        {
+          role: "system",
+          content:
+            "You are IPCoder AI assistant. Be concise and practical. When producing code, prefer fenced code blocks. " +
+            "When agent mode is on and you need local workspace data/actions, respond with only one fenced block using ```ipcoder-tool and raw JSON: " +
+            "{\"action\":\"read_file\",\"path\":\"workspace/README.md\"}. " +
+            "Supported actions: list_files, read_file, write_file, open_file, replace_active_file, append_active_file, save_active_file, search_workspace. " +
+            "After receiving TOOL_RESULT, either emit another ipcoder-tool JSON block or provide final user-facing answer.",
         },
-        body: JSON.stringify({
-          model,
-          temperature: 0.2,
-          messages: [
-            {
-              role: "system",
-              content:
-                "You are IPCoder AI assistant. Be concise and practical. When producing code, prefer fenced code blocks.",
-            },
-            {
-              role: "user",
-              content: `Editor context:\n${contextBlock}`,
-            },
-            ...aiMessages
-              .slice(-10)
-              .filter((message) => message.role === "user" || message.role === "assistant")
-              .map((message) => ({
-                role: message.role,
-                content: message.content,
-              })),
-            {
-              role: "user",
-              content: userMessage,
-            },
-          ],
-        }),
-      });
+        {
+          role: "user",
+          content: `Editor context:\n${contextBlock}`,
+        },
+        ...aiMessages.flatMap((message) =>
+          message.role === "user" || message.role === "assistant"
+            ? [
+                {
+                  role: message.role as "user" | "assistant",
+                  content: message.content,
+                },
+              ]
+            : [],
+        ),
+        {
+          role: "user",
+          content: userMessage,
+        },
+      ];
 
-      const payload = (await response.json()) as {
-        choices?: Array<{
-          message?: {
-            content?: unknown;
-          };
-        }>;
-        error?: { message?: string };
-      };
+      let conversation = [...baseMessages];
+      const maxSteps = aiAgentMode ? 6 : 1;
 
-      if (!response.ok) {
-        throw new Error(payload.error?.message ?? `HTTP ${response.status}`);
+      for (let step = 0; step < maxSteps; step += 1) {
+        const response = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${settings.aiApiKey.trim()}`,
+          },
+          body: JSON.stringify({
+            model,
+            temperature: 0.2,
+            messages: conversation,
+          }),
+        });
+
+        const payload = (await response.json()) as {
+          choices?: Array<{
+            message?: {
+              content?: unknown;
+            };
+          }>;
+          error?: { message?: string };
+        };
+
+        if (!response.ok) {
+          throw new Error(payload.error?.message ?? `HTTP ${response.status}`);
+        }
+
+        const content = coerceAssistantMessage(payload.choices?.[0]?.message?.content);
+        if (!content) {
+          throw new Error("Empty AI response.");
+        }
+
+        pushAiMessage("assistant", content);
+        conversation = [...conversation, { role: "assistant", content }];
+
+        if (!aiAgentMode) {
+          break;
+        }
+
+        const toolRequest = parseAiToolRequest(content);
+        if (!toolRequest) {
+          break;
+        }
+
+        const toolResult = await executeAiToolRequest(toolRequest);
+        const toolResultText = JSON.stringify(toolResult, null, 2);
+        pushAiMessage("assistant", `TOOL_RESULT\n${toolResultText}`);
+        conversation = [
+          ...conversation,
+          {
+            role: "user",
+            content:
+              `TOOL_RESULT:\n${toolResultText}\n` +
+              "If more tool work is needed, return another ```ipcoder-tool JSON block only. Otherwise provide final answer.",
+          },
+        ];
       }
 
-      const content = coerceAssistantMessage(payload.choices?.[0]?.message?.content);
-      if (!content) {
-        throw new Error("Empty AI response.");
-      }
-
-      pushAiMessage("assistant", content);
-      await addCommandHistory(`AI Ask: ${userMessage.slice(0, 48)}`);
-      appendAppLog("info", `AI response generated (${model}).`);
+      await addCommandHistory("AI Ask");
+      appendAppLog("info", `AI response generated (${model}) ${aiAgentMode ? "[agent]" : ""}.`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Request failed.";
       pushAiMessage("error", message);
@@ -2448,10 +3542,12 @@ ${activeTab.content.slice(0, 18000)}`
   }, [
     activeTab,
     addCommandHistory,
+    aiAgentMode,
     aiBusy,
     aiMessages,
     aiPrompt,
     appendAppLog,
+    executeAiToolRequest,
     pushAiMessage,
     settings.aiApiKey,
     settings.aiModel,
@@ -2668,7 +3764,10 @@ ${activeTab.content.slice(0, 18000)}`
         let nextTabs = [...tabs];
         if (nextTabs.length >= MAX_TABS) {
           const removableIndex = nextTabs.findIndex(
-            (tab) => tab.id !== activeTabId && tab.content === tab.savedContent,
+            (tab) =>
+              tab.id !== activeTabId &&
+              tab.content === tab.savedContent &&
+              !pinnedTabPathSet.has(tab.path),
           );
           if (removableIndex === -1) {
             Alert.alert(
@@ -2704,7 +3803,7 @@ ${activeTab.content.slice(0, 18000)}`
         Alert.alert("External File", "Unable to open external file.");
       }
     },
-    [activeTabId, appendAppLog, tabs, touchRecentFile],
+    [activeTabId, appendAppLog, pinnedTabPathSet, tabs, touchRecentFile],
   );
 
   const openExternalEntry = useCallback(
@@ -2740,6 +3839,47 @@ ${activeTab.content.slice(0, 18000)}`
       await addCommandHistory(`Go To Line ${line}`);
     },
     [activeTab, addCommandHistory, sendToEditor],
+  );
+
+  const jumpToFileLocation = useCallback(
+    async (path: string, line: number, col: number) => {
+      if (path.startsWith("content://")) {
+        await openExternalFile(path);
+      } else {
+        await openFile(path);
+      }
+
+      setScreen("editor");
+      const targetLine = Math.max(1, line || 1);
+      const targetCol = Math.max(1, col || 1);
+
+      setTimeout(() => {
+        sendToEditor({
+          type: "setCursor",
+          payload: {
+            line: targetLine,
+            col: targetCol,
+          },
+        });
+      }, 140);
+    },
+    [openExternalFile, openFile, sendToEditor],
+  );
+
+  const openBookmark = useCallback(
+    async (bookmark: BookmarkEntry) => {
+      await jumpToFileLocation(bookmark.filePath, bookmark.line, bookmark.col);
+      setBookmarksVisible(false);
+      await addCommandHistory(`Bookmark ${bookmark.fileName}:${bookmark.line}`);
+    },
+    [addCommandHistory, jumpToFileLocation],
+  );
+
+  const removeBookmark = useCallback(
+    async (bookmarkId: string) => {
+      await persistBookmarks(bookmarks.filter((item) => item.id !== bookmarkId));
+    },
+    [bookmarks, persistBookmarks],
   );
 
   const quickOpenMatches = useMemo(() => {
@@ -3707,6 +4847,7 @@ ${activeTab.content.slice(0, 18000)}`
   const renderTab = (tab: EditorTab) => {
     const isActive = tab.id === activeTabId;
     const unsaved = tab.content !== tab.savedContent;
+    const pinned = pinnedTabPathSet.has(tab.path);
 
     return (
       <View
@@ -3725,8 +4866,14 @@ ${activeTab.content.slice(0, 18000)}`
               unsaved ? styles.tabTextUnsaved : null,
             ]}
           >
+            {pinned ? "[PIN] " : ""}
             {tab.name}
             {unsaved ? " *" : ""}
+          </Text>
+        </Pressable>
+        <Pressable style={styles.tabCloseButton} onPress={() => void togglePinnedTabPath(tab.path)}>
+          <Text style={[styles.tabCloseText, pinned ? styles.tabPinTextActive : styles.tabPinText]}>
+            {pinned ? "U" : "P"}
           </Text>
         </Pressable>
         <Pressable style={styles.tabCloseButton} onPress={() => closeTab(tab.id)}>
@@ -3765,14 +4912,86 @@ ${activeTab.content.slice(0, 18000)}`
     );
   };
 
+  const goToEditorScreen = useCallback(() => {
+    if (!tabs.length) {
+      Alert.alert("Editor", "Open a file first.");
+      return;
+    }
+    setScreen("editor");
+  }, [tabs.length]);
+
+  const renderHeaderNav = (options?: { showSave?: boolean }) => (
+    <ScrollView horizontal style={styles.headerActionsScroll} contentContainerStyle={styles.headerActions}>
+      <Pressable
+        style={[styles.headerButton, screen === "home" ? styles.headerButtonActive : null]}
+        onPress={() => setScreen("home")}
+      >
+        <Text style={styles.headerButtonText}>Files</Text>
+      </Pressable>
+      <Pressable
+        style={[styles.headerButton, screen === "editor" ? styles.headerButtonActive : null]}
+        onPress={goToEditorScreen}
+      >
+        <Text style={styles.headerButtonText}>Editor</Text>
+      </Pressable>
+      <Pressable
+        style={[styles.headerButton, screen === "settings" ? styles.headerButtonActive : null]}
+        onPress={() => setScreen("settings")}
+      >
+        <Text style={styles.headerButtonText}>Settings</Text>
+      </Pressable>
+      <Pressable
+        style={styles.headerButton}
+        onPress={() => {
+          setWorkspaceSearchVisible(true);
+        }}
+      >
+        <Text style={styles.headerButtonText}>Search</Text>
+      </Pressable>
+      <Pressable
+        style={styles.headerButton}
+        onPress={() => {
+          setCommandPaletteVisible(true);
+        }}
+      >
+        <Text style={styles.headerButtonText}>Cmd</Text>
+      </Pressable>
+      {options?.showSave ? (
+        <Pressable style={styles.headerButton} onPress={() => void saveActiveTab()}>
+          <Text style={styles.headerButtonText}>Save</Text>
+        </Pressable>
+      ) : null}
+      <Pressable style={styles.headerButton} onPress={() => openMenu()}>
+        <Text style={styles.headerButtonText}>Menu</Text>
+      </Pressable>
+    </ScrollView>
+  );
+
   const renderHomeScreen = () => (
     <View style={styles.screen}>
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>[IPCoder]</Text>
-        <Pressable style={styles.headerButton} onPress={() => openMenu()}>
-          <Text style={styles.headerButtonText}>[MENU]</Text>
-        </Pressable>
+        <Text style={styles.headerTitle}>IPCoder</Text>
+        {renderHeaderNav()}
       </View>
+
+      <ScrollView
+        horizontal
+        style={styles.homeQuickActions}
+        contentContainerStyle={styles.homeQuickActionsContent}
+      >
+        <Pressable style={styles.quickActionButton} onPress={() => setNewFileModalVisible(true)}>
+          <Text style={styles.quickActionButtonText}>New File</Text>
+        </Pressable>
+        <Pressable style={styles.quickActionButton} onPress={() => setNewFolderModalVisible(true)}>
+          <Text style={styles.quickActionButtonText}>New Folder</Text>
+        </Pressable>
+        <Pressable style={styles.quickActionButton} onPress={() => setProjectTemplateVisible(true)}>
+          <Text style={styles.quickActionButtonText}>Template</Text>
+        </Pressable>
+        <Pressable style={styles.quickActionButton} onPress={() => setBookmarksVisible(true)}>
+          <Text style={styles.quickActionButtonText}>Bookmarks</Text>
+        </Pressable>
+      </ScrollView>
 
       <ScrollView style={styles.scrollArea}>
         <Text style={styles.sectionLabel}>Recent Files</Text>
@@ -3808,6 +5027,15 @@ ${activeTab.content.slice(0, 18000)}`
         <Text style={styles.sectionLabel}>Directory Tree</Text>
         {renderBreadcrumb()}
         <Text style={styles.listHintText}>Long press files/folders for actions.</Text>
+        <TextInput
+          style={[styles.modalInput, { marginHorizontal: 12, marginBottom: 8 }]}
+          value={fileFilterQuery}
+          onChangeText={setFileFilterQuery}
+          autoCapitalize="none"
+          autoCorrect={false}
+          placeholder="Filter files in current directory"
+          placeholderTextColor="#30363D"
+        />
 
         {pinnedFolders.length ? (
           <>
@@ -3878,7 +5106,7 @@ ${activeTab.content.slice(0, 18000)}`
           </Pressable>
         ) : null}
 
-        {entries.map((entry) => (
+        {filteredEntries.map((entry) => (
           <Pressable
             key={entry.path}
             style={styles.fileRow}
@@ -3911,6 +5139,9 @@ ${activeTab.content.slice(0, 18000)}`
             <Text style={styles.fileRowPath}>{formatRelativePath(entry.path)}</Text>
           </Pressable>
         ))}
+        {filteredEntries.length === 0 ? (
+          <Text style={styles.emptyText}>No files match this filter.</Text>
+        ) : null}
       </ScrollView>
     </View>
   );
@@ -3943,7 +5174,7 @@ ${activeTab.content.slice(0, 18000)}`
                 autoCapitalize="none"
                 autoCorrect={false}
                 placeholder="find"
-                placeholderTextColor="#555555"
+                placeholderTextColor="#30363D"
               />
             </View>
             <View style={styles.searchCell}>
@@ -3960,7 +5191,7 @@ ${activeTab.content.slice(0, 18000)}`
                 autoCapitalize="none"
                 autoCorrect={false}
                 placeholder="replace"
-                placeholderTextColor="#555555"
+                placeholderTextColor="#30363D"
               />
             </View>
           </View>
@@ -4014,9 +5245,15 @@ ${activeTab.content.slice(0, 18000)}`
             void formatActiveDocument();
           })}
           {renderToolbarButton("Snippet", () => setSnippetVisible(true))}
+          {renderToolbarButton("Mark", () => {
+            void addBookmarkForActiveCursor();
+          })}
+          {renderToolbarButton("Bookmarks", () => setBookmarksVisible(true))}
           {renderToolbarButton("Cmd", () => setCommandPaletteVisible(true))}
           {renderToolbarButton("AI", () => setAiVisible(true))}
           {renderToolbarButton("Diff", () => setDiffVisible(true))}
+          {renderToolbarButton("Conflicts", () => setConflictVisible(true))}
+          {renderToolbarButton("Queue", () => setSyncQueueVisible(true), githubSyncQueue.length > 0)}
           {renderToolbarButton("Logs", () => setLogVisible(true))}
           {renderToolbarButton(`Outline ${outlineVisible ? "ON" : "OFF"}`, () =>
             setOutlineVisible((prev) => !prev),
@@ -4035,15 +5272,8 @@ ${activeTab.content.slice(0, 18000)}`
   const renderEditorScreen = () => (
     <View style={styles.screen}>
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>[IPCoder]</Text>
-        <View style={styles.headerCompactActions}>
-          <Pressable style={styles.headerButton} onPress={() => void saveActiveTab()}>
-            <Text style={styles.headerButtonText}>[SAVE]</Text>
-          </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => openMenu()}>
-            <Text style={styles.headerButtonText}>[MENU]</Text>
-          </Pressable>
-        </View>
+        <Text style={styles.headerTitle}>{activeTab ? activeTab.name : "Editor"}</Text>
+        {renderHeaderNav({ showSave: true })}
       </View>
 
       <ScrollView horizontal style={styles.tabStrip} contentContainerStyle={styles.tabStripContent}>
@@ -4153,15 +5383,8 @@ ${activeTab.content.slice(0, 18000)}`
   const renderSettingsScreen = () => (
     <View style={styles.screen}>
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>[Settings]</Text>
-        <View style={styles.headerCompactActions}>
-          <Pressable style={styles.headerButton} onPress={() => setScreen("home")}> 
-            <Text style={styles.headerButtonText}>[FILES]</Text>
-          </Pressable>
-          <Pressable style={styles.headerButton} onPress={() => openMenu()}>
-            <Text style={styles.headerButtonText}>[MENU]</Text>
-          </Pressable>
-        </View>
+        <Text style={styles.headerTitle}>Settings</Text>
+        {renderHeaderNav()}
       </View>
 
       <ScrollView style={styles.scrollArea}>
@@ -4171,6 +5394,9 @@ ${activeTab.content.slice(0, 18000)}`
         </Pressable>
         <Pressable style={styles.settingRow} onPress={() => void toggleSetting("lineNumbers")}> 
           <Text style={styles.settingLabel}>[{settings.lineNumbers ? "X" : " "}] Line Numbers</Text>
+        </Pressable>
+        <Pressable style={styles.settingRow} onPress={() => void toggleSetting("autoSave")}> 
+          <Text style={styles.settingLabel}>[{settings.autoSave ? "X" : " "}] Auto Save (debounced)</Text>
         </Pressable>
         <Pressable
           style={styles.settingRow}
@@ -4201,7 +5427,7 @@ ${activeTab.content.slice(0, 18000)}`
             autoCorrect={false}
             secureTextEntry
             placeholder="OpenAI API key"
-            placeholderTextColor="#555555"
+            placeholderTextColor="#30363D"
           />
           <TextInput
             style={[styles.settingInput, styles.settingInputTopGap]}
@@ -4210,7 +5436,7 @@ ${activeTab.content.slice(0, 18000)}`
             autoCapitalize="none"
             autoCorrect={false}
             placeholder="Model (e.g. gpt-4.1-mini)"
-            placeholderTextColor="#555555"
+            placeholderTextColor="#30363D"
           />
           <View style={styles.settingActionRow}>
             <Pressable style={styles.modalButtonPrimary} onPress={() => void saveAiConfiguration()}>
@@ -4249,7 +5475,7 @@ ${activeTab.content.slice(0, 18000)}`
             autoCapitalize="none"
             autoCorrect={false}
             placeholder="Repo owner (e.g. zencoder01)"
-            placeholderTextColor="#555555"
+            placeholderTextColor="#30363D"
           />
           <TextInput
             style={[styles.settingInput, styles.settingInputTopGap]}
@@ -4258,7 +5484,7 @@ ${activeTab.content.slice(0, 18000)}`
             autoCapitalize="none"
             autoCorrect={false}
             placeholder="Repo name (e.g. IPCoder)"
-            placeholderTextColor="#555555"
+            placeholderTextColor="#30363D"
           />
           <TextInput
             style={[styles.settingInput, styles.settingInputTopGap]}
@@ -4267,7 +5493,7 @@ ${activeTab.content.slice(0, 18000)}`
             autoCapitalize="none"
             autoCorrect={false}
             placeholder="Branch (default main)"
-            placeholderTextColor="#555555"
+            placeholderTextColor="#30363D"
           />
           <TextInput
             style={[styles.settingInput, styles.settingInputTopGap]}
@@ -4275,8 +5501,8 @@ ${activeTab.content.slice(0, 18000)}`
             onChangeText={setGithubSyncPathDraft}
             autoCapitalize="none"
             autoCorrect={false}
-            placeholder=".ipcoder-sync/workspace.json"
-            placeholderTextColor="#555555"
+            placeholder=".ipcoder-sync/files"
+            placeholderTextColor="#30363D"
           />
           <TextInput
             style={[styles.settingInput, styles.settingInputTopGap]}
@@ -4286,7 +5512,7 @@ ${activeTab.content.slice(0, 18000)}`
             autoCorrect={false}
             secureTextEntry
             placeholder="GitHub token (repo contents write)"
-            placeholderTextColor="#555555"
+            placeholderTextColor="#30363D"
           />
           <View style={styles.settingActionRow}>
             <Pressable style={styles.modalButtonPrimary} onPress={() => void saveGithubConfiguration()}>
@@ -4308,6 +5534,21 @@ ${activeTab.content.slice(0, 18000)}`
           </Pressable>
           <Pressable style={styles.modalButton} onPress={() => setLogVisible(true)}>
             <Text style={styles.modalButtonText}>App Logs</Text>
+          </Pressable>
+          <Pressable style={styles.modalButton} onPress={() => setHistoryVisible(true)}>
+            <Text style={styles.modalButtonText}>Restore Timeline</Text>
+          </Pressable>
+          <Pressable style={styles.modalButton} onPress={() => setBookmarksVisible(true)}>
+            <Text style={styles.modalButtonText}>Bookmarks</Text>
+          </Pressable>
+          <Pressable style={styles.modalButton} onPress={() => setConflictVisible(true)}>
+            <Text style={styles.modalButtonText}>Conflict Center</Text>
+          </Pressable>
+          <Pressable style={styles.modalButton} onPress={() => setSyncQueueVisible(true)}>
+            <Text style={styles.modalButtonText}>Sync Queue</Text>
+          </Pressable>
+          <Pressable style={styles.modalButton} onPress={() => setSnapshotVisible(true)}>
+            <Text style={styles.modalButtonText}>Snapshots</Text>
           </Pressable>
         </View>
 
@@ -4415,7 +5656,7 @@ ${activeTab.content.slice(0, 18000)}`
           },
         ]}
       >
-        <StatusBar barStyle="light-content" backgroundColor="#000000" translucent={false} />
+        <StatusBar barStyle="light-content" backgroundColor="#0D1117" translucent={false} />
         <View style={styles.loadingWrap}>
           <Text style={styles.loadingText}>{loadingState || "Loading local assets..."}</Text>
         </View>
@@ -4433,7 +5674,7 @@ ${activeTab.content.slice(0, 18000)}`
         },
       ]}
     >
-      <StatusBar barStyle="light-content" backgroundColor="#000000" translucent={false} />
+      <StatusBar barStyle="light-content" backgroundColor="#0D1117" translucent={false} />
 
       {screen === "home" ? renderHomeScreen() : null}
       {screen === "editor" ? renderEditorScreen() : null}
@@ -4460,6 +5701,8 @@ ${activeTab.content.slice(0, 18000)}`
               <Text style={styles.drawerStatusText}>
                 External: {externalSaveDirUri ? "MOUNTED" : "NONE"}
               </Text>
+              <Text style={styles.drawerStatusText}>Bookmarks: {bookmarks.length}</Text>
+              <Text style={styles.drawerStatusText}>Sync Queue: {githubSyncQueue.length}</Text>
             </View>
 
             <ScrollView style={styles.drawerList}>
@@ -4540,6 +5783,22 @@ ${activeTab.content.slice(0, 18000)}`
               >
                 <Text style={styles.drawerButtonText}>[A] AI Assistant</Text>
               </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() =>
+                  runMenuAction(() => {
+                    void addBookmarkForActiveCursor();
+                  })
+                }
+              >
+                <Text style={styles.drawerButtonText}>[M] Add Bookmark</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => runMenuAction(() => setBookmarksVisible(true))}
+              >
+                <Text style={styles.drawerButtonText}>[K] Bookmarks</Text>
+              </Pressable>
 
               <Text style={styles.drawerSectionLabel}>File Actions</Text>
               <Pressable
@@ -4564,6 +5823,20 @@ ${activeTab.content.slice(0, 18000)}`
                 onPress={() => runMenuAction(() => setDiffVisible(true))}
               >
                 <Text style={styles.drawerButtonText}>[D] Diff Before Save</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() =>
+                  runMenuAction(() => {
+                    if (!activeTab) {
+                      Alert.alert("Tabs", "Open a file first.");
+                      return;
+                    }
+                    void togglePinnedTabPath(activeTab.path);
+                  })
+                }
+              >
+                <Text style={styles.drawerButtonText}>[I] Pin/Unpin Active Tab</Text>
               </Pressable>
 
               <Text style={styles.drawerSectionLabel}>External Storage</Text>
@@ -4592,6 +5865,30 @@ ${activeTab.content.slice(0, 18000)}`
                 onPress={() => runMenuAction(() => setLogVisible(true))}
               >
                 <Text style={styles.drawerButtonText}>[L] App Logs</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => runMenuAction(() => setHistoryVisible(true))}
+              >
+                <Text style={styles.drawerButtonText}>[R] Restore Timeline</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => runMenuAction(() => setConflictVisible(true))}
+              >
+                <Text style={styles.drawerButtonText}>[O] Conflict Center</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => runMenuAction(() => setSyncQueueVisible(true))}
+              >
+                <Text style={styles.drawerButtonText}>[Q] Sync Queue</Text>
+              </Pressable>
+              <Pressable
+                style={styles.drawerButton}
+                onPress={() => runMenuAction(() => setSnapshotVisible(true))}
+              >
+                <Text style={styles.drawerButtonText}>[Y] Snapshots</Text>
               </Pressable>
             </ScrollView>
           </Animated.View>
@@ -4815,7 +6112,7 @@ ${activeTab.content.slice(0, 18000)}`
               autoCapitalize="none"
               autoCorrect={false}
               placeholder="Search commands or files"
-              placeholderTextColor="#555555"
+              placeholderTextColor="#30363D"
             />
 
             <View style={styles.inlineInputRow}>
@@ -4825,7 +6122,7 @@ ${activeTab.content.slice(0, 18000)}`
                 onChangeText={setGoToLineValue}
                 keyboardType="number-pad"
                 placeholder="Go to line"
-                placeholderTextColor="#555555"
+                placeholderTextColor="#30363D"
               />
               <Pressable
                 style={styles.modalButtonPrimary}
@@ -4936,12 +6233,48 @@ ${activeTab.content.slice(0, 18000)}`
               <Pressable
                 style={styles.modalButton}
                 onPress={() => {
+                  setBookmarksVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Bookmarks</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setConflictVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Conflicts</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setSyncQueueVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Sync Queue</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
                   setSaveCopyName(activeTab?.name ?? "untitled.txt");
                   setSaveCopyModalVisible(true);
                   setCommandPaletteVisible(false);
                 }}
               >
                 <Text style={styles.modalButtonText}>Save Copy</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  setSnapshotVisible(true);
+                  setCommandPaletteVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Snapshots</Text>
               </Pressable>
             </ScrollView>
 
@@ -5019,7 +6352,7 @@ ${activeTab.content.slice(0, 18000)}`
               autoCapitalize="none"
               autoCorrect={false}
               placeholder="Search text"
-              placeholderTextColor="#555555"
+              placeholderTextColor="#30363D"
             />
             <TextInput
               style={[styles.modalInput, styles.modalInputTopGap]}
@@ -5028,7 +6361,7 @@ ${activeTab.content.slice(0, 18000)}`
               autoCapitalize="none"
               autoCorrect={false}
               placeholder="Replace with"
-              placeholderTextColor="#555555"
+              placeholderTextColor="#30363D"
             />
 
             <View style={styles.modalActions}>
@@ -5126,7 +6459,7 @@ ${activeTab.content.slice(0, 18000)}`
               autoCapitalize="none"
               autoCorrect={false}
               placeholder="Commit message"
-              placeholderTextColor="#555555"
+              placeholderTextColor="#30363D"
             />
             <View style={styles.modalActions}>
               <Pressable style={styles.modalButtonPrimary} onPress={() => void commitTracker()}>
@@ -5191,7 +6524,7 @@ ${activeTab.content.slice(0, 18000)}`
                   void runTerminalCommand();
                 }}
                 placeholder="type command (help)"
-                placeholderTextColor="#555555"
+                placeholderTextColor="#30363D"
               />
               <Pressable style={styles.modalButtonPrimary} onPress={() => void runTerminalCommand()}>
                 <Text style={styles.modalButtonPrimaryText}>Run</Text>
@@ -5282,7 +6615,7 @@ ${activeTab.content.slice(0, 18000)}`
               autoCapitalize="none"
               autoCorrect={false}
               placeholder="File name for copy"
-              placeholderTextColor="#555555"
+              placeholderTextColor="#30363D"
             />
             <View style={styles.modalActions}>
               <Pressable style={styles.modalButton} onPress={() => setSaveCopyModalVisible(false)}>
@@ -5368,7 +6701,7 @@ ${activeTab.content.slice(0, 18000)}`
               autoCapitalize="none"
               autoCorrect={false}
               placeholder="Project folder name"
-              placeholderTextColor="#555555"
+              placeholderTextColor="#30363D"
             />
             <ScrollView style={[styles.modalList, styles.modalListTall]}>
               {PROJECT_TEMPLATES.map((template) => (
@@ -5479,6 +6812,275 @@ ${activeTab.content.slice(0, 18000)}`
         </View>
       </Modal>
 
+      <Modal visible={historyVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>Restore Timeline</Text>
+            <Text style={styles.modalPath}>
+              {activeTab ? `Active: ${activeTab.name}` : "All files"}
+            </Text>
+            <ScrollView style={[styles.modalList, styles.modalListTall]}>
+              {visibleRestorePoints.length ? (
+                visibleRestorePoints.map((point) => (
+                  <Pressable
+                    key={point.id}
+                    style={styles.modalListRow}
+                    onPress={() => {
+                      Alert.alert(
+                        "Apply Restore Point?",
+                        `${point.fileName} • ${point.label}\n${new Date(point.timestamp).toLocaleString()}`,
+                        [
+                          { text: "Cancel", style: "cancel" },
+                          {
+                            text: "Restore",
+                            style: "destructive",
+                            onPress: () => {
+                              void restoreFromPoint(point);
+                            },
+                          },
+                        ],
+                      );
+                    }}
+                  >
+                    <Text style={styles.modalListRowTitle}>{point.fileName}</Text>
+                    <Text style={styles.modalListRowPath}>
+                      {point.label} • {new Date(point.timestamp).toLocaleString()}
+                    </Text>
+                    <Text style={styles.modalListRowPath}>{formatRelativePath(point.filePath)}</Text>
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No restore points yet.</Text>
+              )}
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  void persistRestorePoints([]);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Clear</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setHistoryVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={bookmarksVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>Bookmarks</Text>
+            <Text style={styles.modalPath}>
+              {activeTab ? `Active: ${activeTab.name}` : "All files"}
+            </Text>
+            <ScrollView style={[styles.modalList, styles.modalListTall]}>
+              {visibleBookmarks.length ? (
+                visibleBookmarks.map((bookmark) => (
+                  <Pressable
+                    key={bookmark.id}
+                    style={styles.modalListRow}
+                    onPress={() => {
+                      void openBookmark(bookmark);
+                    }}
+                    onLongPress={() => {
+                      Alert.alert("Remove Bookmark?", `${bookmark.label}`, [
+                        { text: "Cancel", style: "cancel" },
+                        {
+                          text: "Remove",
+                          style: "destructive",
+                          onPress: () => {
+                            void removeBookmark(bookmark.id);
+                          },
+                        },
+                      ]);
+                    }}
+                  >
+                    <Text style={styles.modalListRowTitle}>{bookmark.label}</Text>
+                    <Text style={styles.modalListRowPath}>
+                      {new Date(bookmark.timestamp).toLocaleString()}
+                    </Text>
+                    <Text style={styles.modalListRowPath}>
+                      {formatRelativePath(bookmark.filePath)}
+                    </Text>
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No bookmarks yet.</Text>
+              )}
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  void addBookmarkForActiveCursor();
+                }}
+              >
+                <Text style={styles.modalButtonText}>Add Current</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  void persistBookmarks([]);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Clear</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setBookmarksVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={conflictVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>Conflict Center</Text>
+            <Text style={styles.modalPath}>Files with LOCAL/REMOTE conflict markers.</Text>
+            <ScrollView style={[styles.modalList, styles.modalListTall]}>
+              {conflictPaths.length ? (
+                conflictPaths.map((path) => (
+                  <Pressable
+                    key={path}
+                    style={styles.modalListRow}
+                    onPress={() => {
+                      void jumpToFileLocation(path, 1, 1);
+                      setConflictVisible(false);
+                    }}
+                  >
+                    <Text style={styles.modalListRowTitle}>{basename(path)}</Text>
+                    <Text style={styles.modalListRowPath}>{formatRelativePath(path)}</Text>
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>
+                  {conflictBusy ? "Scanning..." : "No conflicts found."}
+                </Text>
+              )}
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButton} onPress={() => void runConflictScan()}>
+                <Text style={styles.modalButtonText}>{conflictBusy ? "Scanning..." : "Scan"}</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setConflictVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={syncQueueVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>GitHub Sync Queue</Text>
+            <Text style={styles.modalPath}>Failed sync operations ready for retry.</Text>
+            <ScrollView style={[styles.modalList, styles.modalListTall]}>
+              {githubSyncQueue.length ? (
+                githubSyncQueue.map((item) => (
+                  <Pressable
+                    key={item.id}
+                    style={styles.modalListRow}
+                    onPress={() => {
+                      void retryQueuedGithubSync(item);
+                    }}
+                    onLongPress={() => {
+                      void persistGithubSyncQueue(
+                        githubSyncQueue.filter((queued) => queued.id !== item.id),
+                      );
+                    }}
+                  >
+                    <Text style={styles.modalListRowTitle}>
+                      {item.kind.toUpperCase()} • {new Date(item.createdAt).toLocaleString()}
+                    </Text>
+                    <Text style={styles.modalListRowPath}>{item.reason}</Text>
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No queued sync retries.</Text>
+              )}
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  void (async () => {
+                    for (const item of [...githubSyncQueue]) {
+                      await retryQueuedGithubSync(item);
+                    }
+                  })();
+                }}
+              >
+                <Text style={styles.modalButtonText}>Retry All</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => {
+                  void persistGithubSyncQueue([]);
+                }}
+              >
+                <Text style={styles.modalButtonText}>Clear</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setSyncQueueVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={snapshotVisible} transparent animationType="none">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, styles.modalCardTall]}>
+            <Text style={styles.modalTitle}>Workspace Snapshots</Text>
+            <Text style={styles.modalPath}>Export/import app state to local JSON files.</Text>
+            <ScrollView style={[styles.modalList, styles.modalListTall]}>
+              {workspaceSnapshots.length ? (
+                workspaceSnapshots.map((path) => (
+                  <Pressable
+                    key={path}
+                    style={styles.modalListRow}
+                    onPress={() => {
+                      Alert.alert("Import Snapshot?", basename(path), [
+                        { text: "Cancel", style: "cancel" },
+                        {
+                          text: "Import",
+                          style: "destructive",
+                          onPress: () => {
+                            void importWorkspaceSnapshot(path);
+                          },
+                        },
+                      ]);
+                    }}
+                  >
+                    <Text style={styles.modalListRowTitle}>{basename(path)}</Text>
+                    <Text style={styles.modalListRowPath}>{formatRelativePath(path)}</Text>
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No snapshots exported yet.</Text>
+              )}
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalButtonPrimary} onPress={() => void exportWorkspaceSnapshot()}>
+                <Text style={styles.modalButtonPrimaryText}>{snapshotBusy ? "Working..." : "Export"}</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => void listWorkspaceSnapshots()}>
+                <Text style={styles.modalButtonText}>Refresh</Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setSnapshotVisible(false)}>
+                <Text style={styles.modalButtonText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
       <Modal visible={githubSyncVisible} transparent animationType="none">
         <View style={styles.modalBackdrop}>
           <View style={[styles.modalCard, styles.modalCardTall]}>
@@ -5489,17 +7091,21 @@ ${activeTab.content.slice(0, 18000)}`
                 : "Configure repository in Settings first."}
             </Text>
             <Text style={styles.settingHint}>
-              Sync path: {settings.githubSyncPath || ".ipcoder-sync/workspace.json"}
+              Sync root: {resolveGithubSyncRootPath(settings.githubSyncPath)}
             </Text>
+            <Text style={styles.settingHint}>
+              Last file sync: {githubFileSyncState.lastSyncAt ? new Date(githubFileSyncState.lastSyncAt).toLocaleString() : "never"}
+            </Text>
+            <Text style={styles.settingHint}>Queued retries: {githubSyncQueue.length}</Text>
             <View style={styles.modalActions}>
               <Pressable
                 style={styles.modalButtonPrimary}
                 onPress={() => {
-                  void pushWorkspaceSnapshotToGithub();
+                  void pushWorkspaceFilesToGithub();
                 }}
               >
                 <Text style={styles.modalButtonPrimaryText}>
-                  {githubSyncBusy ? "Working..." : "Push Workspace Snapshot"}
+                  {githubSyncBusy ? "Working..." : "Push Files"}
                 </Text>
               </Pressable>
             </View>
@@ -5507,12 +7113,15 @@ ${activeTab.content.slice(0, 18000)}`
               <Pressable
                 style={styles.modalButton}
                 onPress={() => {
-                  void pullWorkspaceSnapshotFromGithub();
+                  void pullWorkspaceFilesFromGithub();
                 }}
               >
                 <Text style={styles.modalButtonText}>
-                  {githubSyncBusy ? "Working..." : "Pull Workspace Snapshot"}
+                  {githubSyncBusy ? "Working..." : "Pull Files"}
                 </Text>
+              </Pressable>
+              <Pressable style={styles.modalButton} onPress={() => setSyncQueueVisible(true)}>
+                <Text style={styles.modalButtonText}>Queue</Text>
               </Pressable>
               <Pressable style={styles.modalButton} onPress={() => setGithubSyncVisible(false)}>
                 <Text style={styles.modalButtonText}>Close</Text>
@@ -5522,96 +7131,131 @@ ${activeTab.content.slice(0, 18000)}`
         </View>
       </Modal>
 
-      <Modal visible={aiVisible} transparent animationType="none">
-        <View style={styles.modalBackdrop}>
-          <View style={[styles.modalCard, styles.modalCardTall]}>
-            <Text style={styles.modalTitle}>AI Assistant (Online)</Text>
-
-            <Text style={styles.modalSectionLabel}>Model</Text>
-            <TextInput
-              style={styles.modalInput}
-              value={aiModelDraft}
-              onChangeText={setAiModelDraft}
-              autoCapitalize="none"
-              autoCorrect={false}
-              placeholder="gpt-4.1-mini"
-              placeholderTextColor="#555555"
-            />
-            <Text style={styles.modalSectionLabel}>API Key</Text>
-            <TextInput
-              style={styles.modalInput}
-              value={aiApiKeyDraft}
-              onChangeText={setAiApiKeyDraft}
-              autoCapitalize="none"
-              autoCorrect={false}
-              secureTextEntry
-              placeholder="sk-..."
-              placeholderTextColor="#555555"
-            />
-            <View style={styles.modalActions}>
-              <Pressable style={styles.modalButton} onPress={() => void saveAiConfiguration()}>
-                <Text style={styles.modalButtonText}>Save Config</Text>
+      <Modal visible={aiVisible} animationType="slide" onRequestClose={() => setAiVisible(false)}>
+        <View
+          style={[
+            styles.aiFullScreenRoot,
+            {
+              paddingTop: insets.top,
+              paddingBottom: Math.max(insets.bottom, 8),
+            },
+          ]}
+        >
+          <View style={styles.aiFullHeader}>
+            <Pressable style={styles.headerButton} onPress={() => setAiVisible(false)}>
+              <Text style={styles.headerButtonText}>Back</Text>
+            </Pressable>
+            <Text style={styles.aiFullHeaderTitle}>IPCoder AI</Text>
+            <View style={styles.aiHeaderActions}>
+              <Pressable
+                style={styles.headerButton}
+                onPress={() => setAiAgentMode((prev) => !prev)}
+              >
+                <Text style={styles.headerButtonText}>{aiAgentMode ? "Agent ON" : "Agent OFF"}</Text>
+              </Pressable>
+              <Pressable
+                style={styles.headerButton}
+                onPress={() => setAiConfigVisible((prev) => !prev)}
+              >
+                <Text style={styles.headerButtonText}>Config</Text>
+              </Pressable>
+              <Pressable style={styles.headerButton} onPress={() => setAiMessages([])}>
+                <Text style={styles.headerButtonText}>Clear</Text>
               </Pressable>
             </View>
+          </View>
 
-            <ScrollView style={styles.aiMessagesWrap}>
-              {aiMessages.length ? (
-                aiMessages.map((message) => (
-                  <View
-                    key={message.id}
-                    style={[
-                      styles.aiMessageRow,
-                      message.role === "user"
-                        ? styles.aiMessageUser
-                        : message.role === "assistant"
-                          ? styles.aiMessageAssistant
-                          : styles.aiMessageError,
-                    ]}
-                  >
-                    <Text style={styles.aiMessageRole}>
-                      {message.role === "user" ? "YOU" : message.role === "assistant" ? "AI" : "ERR"}
-                    </Text>
-                    <Text style={styles.aiMessageText}>{message.content}</Text>
-                  </View>
-                ))
-              ) : (
-                <Text style={styles.emptyText}>No AI messages yet.</Text>
-              )}
-            </ScrollView>
+          {aiConfigVisible ? (
+            <View style={styles.aiConfigPanel}>
+              <Text style={styles.modalSectionLabel}>Model</Text>
+              <TextInput
+                style={styles.modalInput}
+                value={aiModelDraft}
+                onChangeText={setAiModelDraft}
+                autoCapitalize="none"
+                autoCorrect={false}
+                placeholder="gpt-4.1-mini"
+                placeholderTextColor="#30363D"
+              />
+              <Text style={styles.modalSectionLabel}>API Key</Text>
+              <TextInput
+                style={styles.modalInput}
+                value={aiApiKeyDraft}
+                onChangeText={setAiApiKeyDraft}
+                autoCapitalize="none"
+                autoCorrect={false}
+                secureTextEntry
+                placeholder="sk-..."
+                placeholderTextColor="#30363D"
+              />
+              <View style={styles.modalActions}>
+                <Pressable style={styles.modalButtonPrimary} onPress={() => void saveAiConfiguration()}>
+                  <Text style={styles.modalButtonPrimaryText}>Save AI Config</Text>
+                </Pressable>
+              </View>
+            </View>
+          ) : null}
 
+          <ScrollView style={styles.aiFullMessagesWrap} contentContainerStyle={styles.aiFullMessagesContent}>
+            {aiMessages.length ? (
+              aiMessages.map((message) => (
+                <View
+                  key={message.id}
+                  style={[
+                    styles.aiFullMessageBubble,
+                    message.role === "user"
+                      ? styles.aiFullMessageUser
+                      : message.role === "assistant"
+                        ? styles.aiFullMessageAssistant
+                        : styles.aiFullMessageError,
+                  ]}
+                >
+                  <Text style={styles.aiMessageRole}>
+                    {message.role === "user" ? "YOU" : message.role === "assistant" ? "AI" : "ERROR"}
+                  </Text>
+                  <Text style={styles.aiMessageText}>{message.content}</Text>
+                </View>
+              ))
+            ) : (
+              <Text style={styles.emptyText}>Start a conversation.</Text>
+            )}
+          </ScrollView>
+
+          <View style={styles.aiComposerWrap}>
             <TextInput
-              style={[styles.modalInput, styles.modalInputTopGap, styles.aiPromptInput]}
+              style={styles.aiComposerInput}
               value={aiPrompt}
               onChangeText={setAiPrompt}
               autoCapitalize="none"
               autoCorrect={false}
               multiline
-              placeholder="Ask AI about the current file..."
-              placeholderTextColor="#555555"
+              placeholder="Message IPCoder AI..."
+              placeholderTextColor="#30363D"
             />
 
-            <View style={styles.modalActions}>
-              <Pressable style={styles.modalButton} onPress={() => setAiPrompt("Explain this file and suggest improvements.")}>
+            <ScrollView horizontal contentContainerStyle={styles.aiQuickActionRow}>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => setAiPrompt("Explain this code and propose a better structure.")}
+              >
                 <Text style={styles.modalButtonText}>Explain</Text>
               </Pressable>
-              <Pressable style={styles.modalButton} onPress={() => setAiPrompt("Refactor this file for readability and maintainability.")}>
-                <Text style={styles.modalButtonText}>Refactor</Text>
+              <Pressable
+                style={styles.modalButton}
+                onPress={() => setAiPrompt("Act as an agent: inspect project files and propose concrete edits.")}
+              >
+                <Text style={styles.modalButtonText}>Agent Task</Text>
               </Pressable>
-              <Pressable style={styles.modalButtonPrimary} onPress={() => void askAi()}>
-                <Text style={styles.modalButtonPrimaryText}>{aiBusy ? "Working..." : "Ask AI"}</Text>
-              </Pressable>
-            </View>
-            <View style={styles.modalActions}>
               <Pressable style={styles.modalButton} onPress={() => void applyLatestAiCode(false)}>
-                <Text style={styles.modalButtonText}>Insert Reply</Text>
+                <Text style={styles.modalButtonText}>Insert Last Reply</Text>
               </Pressable>
               <Pressable style={styles.modalButtonPrimary} onPress={() => void applyLatestAiCode(true)}>
                 <Text style={styles.modalButtonPrimaryText}>Replace File</Text>
               </Pressable>
-              <Pressable style={styles.modalButton} onPress={() => setAiVisible(false)}>
-                <Text style={styles.modalButtonText}>Close</Text>
+              <Pressable style={styles.modalButtonPrimary} onPress={() => void askAi()}>
+                <Text style={styles.modalButtonPrimaryText}>{aiBusy ? "Working..." : "Send"}</Text>
               </Pressable>
-            </View>
+            </ScrollView>
           </View>
         </View>
       </Modal>
@@ -5630,25 +7274,26 @@ export default function App() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
   },
   screen: {
     flex: 1,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
   },
   header: {
     minHeight: 56,
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 12,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
   },
   headerTitle: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontSize: 18,
     fontFamily: "SpaceGrotesk_700Bold",
+    maxWidth: 180,
   },
   headerActions: {
     flexDirection: "row",
@@ -5657,6 +7302,7 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
     paddingLeft: 6,
     paddingRight: 2,
+    paddingBottom: 8,
   },
   headerActionsScroll: {
     flex: 1,
@@ -5671,11 +7317,40 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 6,
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
+    borderRadius: 10,
+  },
+  headerButtonActive: {
+    borderColor: "#2EE6A6",
+    backgroundColor: "#161B22",
   },
   headerButtonText: {
-    color: "#00FF41",
+    color: "#2EE6A6",
+    fontFamily: "JetBrainsMono_500Medium",
+    fontSize: 12,
+  },
+  homeQuickActions: {
+    borderBottomWidth: 1,
+    borderBottomColor: "#30363D",
+    backgroundColor: "#0D1117",
+  },
+  homeQuickActionsContent: {
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    gap: 8,
+  },
+  quickActionButton: {
+    borderWidth: 1,
+    borderColor: "#30363D",
+    backgroundColor: "#161B22",
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  quickActionButtonText: {
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
@@ -5683,7 +7358,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   sectionLabel: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "SpaceGrotesk_700Bold",
     fontSize: 14,
     marginTop: 16,
@@ -5691,7 +7366,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
   },
   emptyText: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "SpaceGrotesk_400Regular",
     fontSize: 13,
     paddingHorizontal: 12,
@@ -5700,7 +7375,7 @@ const styles = StyleSheet.create({
   breadcrumbWrap: {
     borderTopWidth: 1,
     borderBottomWidth: 1,
-    borderColor: "#555555",
+    borderColor: "#30363D",
     minHeight: 40,
   },
   breadcrumbNode: {
@@ -5710,43 +7385,47 @@ const styles = StyleSheet.create({
     paddingHorizontal: 6,
   },
   breadcrumbText: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   breadcrumbDivider: {
-    color: "#555555",
+    color: "#30363D",
     marginLeft: 8,
     fontFamily: "JetBrainsMono_500Medium",
   },
   fileRow: {
     minHeight: 48,
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 12,
     justifyContent: "center",
+    borderRadius: 8,
+    marginHorizontal: 8,
+    marginBottom: 6,
+    borderWidth: 1,
   },
   fileRowName: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "SpaceGrotesk_400Regular",
     fontSize: 14,
   },
   fileRowDirectory: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 13,
   },
   fileRowPath: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginTop: 2,
   },
   fileRowDraft: {
-    color: "#FF003C",
+    color: "#FF5C7C",
   },
   listHintText: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     paddingHorizontal: 12,
@@ -5754,56 +7433,60 @@ const styles = StyleSheet.create({
   },
   bulkBar: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 12,
     paddingVertical: 8,
     gap: 8,
   },
   bulkBarText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   bulkButton: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
+    borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 8,
     alignItems: "center",
   },
   bulkButtonText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   bulkButtonDanger: {
     borderWidth: 1,
-    borderColor: "#FF003C",
-    backgroundColor: "#000000",
+    borderColor: "#FF5C7C",
+    backgroundColor: "#0D1117",
+    borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 8,
     alignItems: "center",
   },
   bulkButtonDangerText: {
-    color: "#FF003C",
+    color: "#FF5C7C",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   selectionToggle: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 12,
     paddingVertical: 10,
+    marginHorizontal: 8,
+    borderRadius: 10,
   },
   selectionToggleText: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   tabStrip: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     minHeight: 42,
     maxHeight: 42,
   },
@@ -5814,19 +7497,22 @@ const styles = StyleSheet.create({
     minWidth: 120,
     maxWidth: 220,
     borderRightWidth: 1,
-    borderRightColor: "#555555",
+    borderRightColor: "#30363D",
     borderTopWidth: 2,
     borderTopColor: "transparent",
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
     flexDirection: "row",
     alignItems: "center",
+    borderTopLeftRadius: 8,
+    borderTopRightRadius: 8,
+    marginRight: 4,
   },
   tabItemActive: {
-    borderTopColor: "#00FF41",
-    backgroundColor: "#111111",
+    borderTopColor: "#2EE6A6",
+    backgroundColor: "#161B22",
   },
   tabItemUnsaved: {
-    borderTopColor: "#FF003C",
+    borderTopColor: "#FF5C7C",
   },
   tabLabelWrap: {
     flex: 1,
@@ -5835,28 +7521,34 @@ const styles = StyleSheet.create({
     minHeight: 40,
   },
   tabText: {
-    color: "#AAAAAA",
+    color: "#9BA7B4",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
   },
   tabTextActive: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
   },
   tabTextUnsaved: {
-    color: "#FF003C",
+    color: "#FF5C7C",
   },
   tabCloseButton: {
     width: 28,
     minHeight: 40,
     borderLeftWidth: 1,
-    borderLeftColor: "#555555",
+    borderLeftColor: "#30363D",
     alignItems: "center",
     justifyContent: "center",
   },
   tabCloseText: {
-    color: "#FF003C",
+    color: "#FF5C7C",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
+  },
+  tabPinText: {
+    color: "#30363D",
+  },
+  tabPinTextActive: {
+    color: "#2EE6A6",
   },
   editorArea: {
     flex: 1,
@@ -5872,20 +7564,20 @@ const styles = StyleSheet.create({
   },
   webview: {
     flex: 1,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
   },
   miniMapWrap: {
     width: 84,
     borderLeftWidth: 1,
-    borderLeftColor: "#555555",
-    backgroundColor: "#000000",
+    borderLeftColor: "#30363D",
+    backgroundColor: "#0D1117",
   },
   miniMapTitle: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 10,
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 6,
     paddingVertical: 4,
   },
@@ -5895,7 +7587,7 @@ const styles = StyleSheet.create({
     paddingTop: 4,
   },
   miniMapLine: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 8,
     lineHeight: 10,
@@ -5907,25 +7599,25 @@ const styles = StyleSheet.create({
     width: 220,
     maxHeight: 260,
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
   },
   outlineHeader: {
     minHeight: 30,
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
     paddingHorizontal: 8,
   },
   outlineTitle: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 11,
   },
   outlineCloseText: {
-    color: "#FF003C",
+    color: "#FF5C7C",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 11,
   },
@@ -5934,17 +7626,17 @@ const styles = StyleSheet.create({
   },
   outlineRow: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 6,
   },
   outlineRowText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
   },
   outlineEmpty: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     paddingHorizontal: 8,
@@ -5953,8 +7645,8 @@ const styles = StyleSheet.create({
   toolbarWrap: {
     minHeight: 46,
     borderTopWidth: 1,
-    borderTopColor: "#555555",
-    backgroundColor: "#000000",
+    borderTopColor: "#30363D",
+    backgroundColor: "#0D1117",
   },
   toolbarContent: {
     alignItems: "center",
@@ -5963,28 +7655,29 @@ const styles = StyleSheet.create({
   },
   toolbarButton: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
+    borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 6,
     marginVertical: 6,
   },
   toolbarButtonActive: {
-    borderColor: "#00FF41",
-    backgroundColor: "#111111",
+    borderColor: "#2EE6A6",
+    backgroundColor: "#161B22",
   },
   toolbarButtonText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   toolbarButtonTextActive: {
-    color: "#00FF41",
+    color: "#2EE6A6",
   },
   searchPalette: {
     borderTopWidth: 1,
-    borderTopColor: "#555555",
-    backgroundColor: "#000000",
+    borderTopColor: "#30363D",
+    backgroundColor: "#0D1117",
     paddingTop: 8,
     paddingBottom: 6,
     paddingHorizontal: 8,
@@ -5997,20 +7690,21 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   searchLabel: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 11,
     marginBottom: 4,
   },
   searchInput: {
     borderWidth: 1,
-    borderColor: "#555555",
-    color: "#FFFFFF",
+    borderColor: "#30363D",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
     paddingHorizontal: 8,
     paddingVertical: 6,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
+    borderRadius: 10,
   },
   searchOptions: {
     marginTop: 8,
@@ -6023,53 +7717,55 @@ const styles = StyleSheet.create({
   statusBarWrap: {
     height: 24,
     borderTopWidth: 1,
-    borderTopColor: "#555555",
+    borderTopColor: "#30363D",
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
     paddingHorizontal: 8,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
   },
   statusBarText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
   },
   settingRow: {
     minHeight: 48,
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     justifyContent: "center",
     paddingHorizontal: 12,
   },
   settingLabel: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 13,
   },
   settingBlock: {
     borderWidth: 1,
-    borderColor: "#555555",
+    borderColor: "#30363D",
     marginHorizontal: 12,
     marginBottom: 10,
     padding: 10,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
+    borderRadius: 12,
   },
   settingHint: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginBottom: 8,
   },
   settingInput: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
-    color: "#FFFFFF",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
     paddingHorizontal: 8,
     paddingVertical: 8,
+    borderRadius: 10,
   },
   settingInputTopGap: {
     marginTop: 8,
@@ -6088,39 +7784,40 @@ const styles = StyleSheet.create({
     flexWrap: "wrap",
   },
   settingValue: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
   },
   pluginCard: {
     borderWidth: 1,
-    borderColor: "#555555",
+    borderColor: "#30363D",
     marginHorizontal: 12,
     marginBottom: 10,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
     padding: 8,
     gap: 6,
+    borderRadius: 12,
   },
   pluginTitle: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "SpaceGrotesk_700Bold",
     fontSize: 13,
   },
   pluginCommandButton: {
     borderWidth: 1,
-    borderColor: "#555555",
+    borderColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 7,
   },
   pluginCommandText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
   },
   resetButton: {
     borderWidth: 1,
-    borderColor: "#FF003C",
-    backgroundColor: "#000000",
+    borderColor: "#FF5C7C",
+    backgroundColor: "#0D1117",
     marginHorizontal: 12,
     marginTop: 20,
     marginBottom: 24,
@@ -6128,7 +7825,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   resetButtonText: {
-    color: "#FF003C",
+    color: "#FF5C7C",
     fontFamily: "SpaceGrotesk_700Bold",
     fontSize: 13,
   },
@@ -6139,7 +7836,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
   },
   loadingText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 13,
     textAlign: "center",
@@ -6159,7 +7856,7 @@ const styles = StyleSheet.create({
   },
   drawerScrim: {
     flex: 1,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
   },
   drawerScrimTouch: {
     flex: 1,
@@ -6167,11 +7864,13 @@ const styles = StyleSheet.create({
   drawerPanel: {
     width: DRAWER_WIDTH,
     borderLeftWidth: 1,
-    borderLeftColor: "#555555",
-    backgroundColor: "#000000",
+    borderLeftColor: "#30363D",
+    backgroundColor: "#0D1117",
     paddingTop: 16,
     paddingBottom: 16,
     paddingHorizontal: 10,
+    borderTopLeftRadius: 14,
+    borderBottomLeftRadius: 14,
   },
   drawerHeaderRow: {
     flexDirection: "row",
@@ -6180,40 +7879,40 @@ const styles = StyleSheet.create({
     marginBottom: 10,
   },
   drawerTitle: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "SpaceGrotesk_700Bold",
     fontSize: 16,
   },
   drawerCloseButton: {
     borderWidth: 1,
-    borderColor: "#555555",
+    borderColor: "#30363D",
     width: 30,
     height: 30,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
   },
   drawerCloseText: {
-    color: "#FF003C",
+    color: "#FF5C7C",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   drawerStatusCard: {
     borderWidth: 1,
-    borderColor: "#555555",
+    borderColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 8,
     marginBottom: 10,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
   },
   drawerStatusText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginBottom: 2,
   },
   drawerSectionLabel: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 11,
     marginBottom: 6,
@@ -6224,14 +7923,15 @@ const styles = StyleSheet.create({
   },
   drawerButton: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
+    borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 10,
     marginBottom: 8,
   },
   drawerButtonText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
@@ -6243,34 +7943,36 @@ const styles = StyleSheet.create({
   },
   modalCard: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
     padding: 12,
+    borderRadius: 14,
   },
   modalCardTall: {
     maxHeight: "92%",
   },
   modalTitle: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "SpaceGrotesk_700Bold",
     fontSize: 16,
     marginBottom: 4,
   },
   modalPath: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
     marginBottom: 10,
   },
   modalInput: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
-    color: "#FFFFFF",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 13,
     paddingHorizontal: 8,
     paddingVertical: 8,
+    borderRadius: 10,
   },
   modalInputTopGap: {
     marginTop: 8,
@@ -6293,7 +7995,7 @@ const styles = StyleSheet.create({
     paddingBottom: 2,
   },
   modalSectionLabel: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 11,
     marginTop: 10,
@@ -6302,35 +8004,35 @@ const styles = StyleSheet.create({
   modalList: {
     maxHeight: 140,
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
   },
   modalListTall: {
     maxHeight: 360,
   },
   modalListRow: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 8,
   },
   modalListRowTitle: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   modalListRowPath: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginTop: 2,
   },
   historyRowText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 8,
   },
@@ -6342,17 +8044,17 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
   },
   diffLineSame: {
-    color: "#AAAAAA",
+    color: "#9BA7B4",
   },
   diffLineAdd: {
-    color: "#00FF41",
+    color: "#2EE6A6",
   },
   diffLineDel: {
-    color: "#FF003C",
+    color: "#FF5C7C",
   },
   logRow: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 8,
   },
@@ -6362,19 +8064,19 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   logLevelInfo: {
-    color: "#00FF41",
+    color: "#2EE6A6",
   },
   logLevelError: {
-    color: "#FF003C",
+    color: "#FF5C7C",
   },
   logText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     lineHeight: 16,
   },
   searchBusyText: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
     marginTop: 8,
@@ -6382,111 +8084,111 @@ const styles = StyleSheet.create({
   },
   searchResultRow: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 8,
   },
   searchResultTitle: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   searchResultPath: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginTop: 2,
   },
   searchResultSnippet: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginTop: 4,
   },
   trackerRow: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 8,
   },
   trackerRowTitle: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   trackerRowPath: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginTop: 2,
   },
   commitRow: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 8,
   },
   commitRowTitle: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   commitRowMeta: {
-    color: "#555555",
+    color: "#30363D",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 11,
     marginTop: 2,
   },
   terminalLogWrap: {
     borderWidth: 1,
-    borderColor: "#555555",
+    borderColor: "#30363D",
     maxHeight: 260,
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
     marginTop: 6,
   },
   terminalLine: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
     paddingHorizontal: 8,
     paddingVertical: 4,
   },
   terminalLineError: {
-    color: "#FF003C",
+    color: "#FF5C7C",
   },
   terminalLineInput: {
-    color: "#00FF41",
+    color: "#2EE6A6",
   },
   aiMessagesWrap: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
     marginTop: 8,
     maxHeight: 240,
   },
   aiMessageRow: {
     borderBottomWidth: 1,
-    borderBottomColor: "#555555",
+    borderBottomColor: "#30363D",
     paddingHorizontal: 8,
     paddingVertical: 8,
   },
   aiMessageUser: {
-    backgroundColor: "#111111",
+    backgroundColor: "#161B22",
   },
   aiMessageAssistant: {
-    backgroundColor: "#000000",
+    backgroundColor: "#0D1117",
   },
   aiMessageError: {
     backgroundColor: "#1A0000",
   },
   aiMessageRole: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 10,
     marginBottom: 4,
   },
   aiMessageText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_400Regular",
     fontSize: 12,
     lineHeight: 18,
@@ -6495,26 +8197,111 @@ const styles = StyleSheet.create({
     minHeight: 80,
     textAlignVertical: "top",
   },
+  aiFullScreenRoot: {
+    flex: 1,
+    backgroundColor: "#0D1117",
+  },
+  aiFullHeader: {
+    minHeight: 56,
+    borderBottomWidth: 1,
+    borderBottomColor: "#30363D",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingHorizontal: 12,
+  },
+  aiFullHeaderTitle: {
+    color: "#E6EDF3",
+    fontFamily: "SpaceGrotesk_700Bold",
+    fontSize: 18,
+    flex: 1,
+  },
+  aiHeaderActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  aiConfigPanel: {
+    borderBottomWidth: 1,
+    borderBottomColor: "#30363D",
+    paddingHorizontal: 12,
+    paddingBottom: 10,
+  },
+  aiFullMessagesWrap: {
+    flex: 1,
+  },
+  aiFullMessagesContent: {
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    gap: 10,
+  },
+  aiFullMessageBubble: {
+    borderWidth: 1,
+    borderColor: "#30363D",
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    maxWidth: "95%",
+  },
+  aiFullMessageUser: {
+    alignSelf: "flex-end",
+    backgroundColor: "#161B22",
+    borderColor: "#2EE6A6",
+  },
+  aiFullMessageAssistant: {
+    alignSelf: "flex-start",
+    backgroundColor: "#0D1117",
+  },
+  aiFullMessageError: {
+    alignSelf: "flex-start",
+    backgroundColor: "#2A1318",
+    borderColor: "#FF5C7C",
+  },
+  aiComposerWrap: {
+    borderTopWidth: 1,
+    borderTopColor: "#30363D",
+    paddingHorizontal: 12,
+    paddingTop: 10,
+  },
+  aiComposerInput: {
+    borderWidth: 1,
+    borderColor: "#30363D",
+    borderRadius: 12,
+    backgroundColor: "#0D1117",
+    color: "#E6EDF3",
+    fontFamily: "JetBrainsMono_400Regular",
+    fontSize: 13,
+    minHeight: 88,
+    maxHeight: 280,
+    textAlignVertical: "top",
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+  },
+  aiQuickActionRow: {
+    alignItems: "center",
+    gap: 8,
+    paddingVertical: 10,
+  },
   actionMenuList: {
     gap: 8,
   },
   actionMenuButton: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
     paddingHorizontal: 10,
     paddingVertical: 10,
   },
   actionMenuButtonText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   actionMenuButtonDanger: {
-    borderColor: "#FF003C",
+    borderColor: "#FF5C7C",
   },
   actionMenuButtonDangerText: {
-    color: "#FF003C",
+    color: "#FF5C7C",
   },
   modalActions: {
     flexDirection: "row",
@@ -6524,25 +8311,27 @@ const styles = StyleSheet.create({
   },
   modalButton: {
     borderWidth: 1,
-    borderColor: "#555555",
-    backgroundColor: "#000000",
+    borderColor: "#30363D",
+    backgroundColor: "#0D1117",
+    borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 8,
   },
   modalButtonText: {
-    color: "#FFFFFF",
+    color: "#E6EDF3",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
   modalButtonPrimary: {
     borderWidth: 1,
-    borderColor: "#00FF41",
-    backgroundColor: "#111111",
+    borderColor: "#2EE6A6",
+    backgroundColor: "#161B22",
+    borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 8,
   },
   modalButtonPrimaryText: {
-    color: "#00FF41",
+    color: "#2EE6A6",
     fontFamily: "JetBrainsMono_500Medium",
     fontSize: 12,
   },
